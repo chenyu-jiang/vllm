@@ -81,6 +81,7 @@ def run_vllm(
         trust_remote_code=trust_remote_code,
         dtype=dtype,
         max_model_len=max_model_len,
+        disable_log_stats=False,
     )
 
     # Add the requests to the engine.

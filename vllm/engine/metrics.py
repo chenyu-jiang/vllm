@@ -24,6 +24,8 @@ gauge_gpu_cache_usage = Gauge(
 gauge_cpu_cache_usage = Gauge(
     "vllm:cpu_cache_usage_perc",
     "CPU KV-cache usage. 1 means 100 percent usage.")
+gauge_avg_step_time = Gauge("vllm:avg_step_time_ms",
+                            "Average time per step in milliseconds.")
 # end-metrics-definitions
 
 labels = {}
@@ -41,6 +43,7 @@ def record_metrics(
     scheduler_waiting: int,
     gpu_cache_usage: float,
     cpu_cache_usage: float,
+    avg_step_time: float,
 ):
     gauge_avg_prompt_throughput.set(labels, avg_prompt_throughput)
     gauge_avg_generation_throughput.set(labels, avg_generation_throughput)
@@ -49,3 +52,4 @@ def record_metrics(
     gauge_scheduler_waiting.set(labels, scheduler_waiting)
     gauge_gpu_cache_usage.set(labels, gpu_cache_usage)
     gauge_cpu_cache_usage.set(labels, cpu_cache_usage)
+    gauge_avg_step_time.set(labels, avg_step_time)

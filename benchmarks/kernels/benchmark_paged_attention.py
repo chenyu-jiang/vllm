@@ -1,6 +1,8 @@
 import argparse
 import random
 import time
+import os
+from dataclasses import dataclass
 
 import torch
 
@@ -8,6 +10,45 @@ from vllm._C import ops
 
 NUM_BLOCKS = 1024
 PARTITION_SIZE = 512
+
+
+@dataclass
+class ProfileResult:
+    batch_size: int
+    block_size: int
+    context_len: int
+    dtype: str
+    head_size: int
+    num_kv_heads: int
+    num_query_heads: int
+    profile: bool
+    seed: int
+    use_alibi: bool
+    version: str
+    latency_us: float
+    throughput_seqs: float
+    throughput_kv_tokens: float
+    throughput_kv_MB: float
+
+    def to_csv_row(self):
+        return ",".join([
+            str(self.batch_size),
+            str(self.block_size),
+            str(self.context_len),
+            self.dtype,
+            str(self.head_size),
+            str(self.num_kv_heads),
+            str(self.num_query_heads),
+            str(self.profile),
+            str(self.seed),
+            str(self.use_alibi),
+            self.version,
+            str(self.latency_us),
+            str(self.throughput_seqs),
+            str(self.throughput_kv_tokens),
+            str(self.throughput_kv_MB),
+        ])
+
 
 
 @torch.inference_mode()
@@ -147,6 +188,48 @@ def main(
     else:
         latency = run_benchmark(num_iters=100, profile=False)
     print(f"Kernel running time: {latency * 1000000:.3f} us")
+    print(f"Throughput in Seqs: {num_seqs / latency:.3f} seqs/s")
+    print(f"Throughput in KV Tokens: {num_seqs * context_len / latency:.3f} tokens/s")
+    n_bytes_per_token = torch.tensor([], dtype=dtype).element_size() * head_size * num_kv_heads * 2
+    print(f"Throughput in KV Bytes: {num_seqs * context_len / latency * n_bytes_per_token / 1000000:.3f} MB/s")
+    if not os.path.exists("paged_attention_profile.csv"):
+        with open("paged_attention_profile.csv", "w") as f:
+            # write header
+            f.write(",".join([
+                "batch_size",
+                "block_size",
+                "context_len",
+                "dtype",
+                "head_size",
+                "num_kv_heads",
+                "num_query_heads",
+                "profile",
+                "seed",
+                "use_alibi",
+                "version",
+                "latency_us",
+                "throughput_seqs",
+                "throughput_kv_tokens",
+                "throughput_kv_MB",
+            ]) + "\n")
+    with open("paged_attention_profile.csv", "a") as f:
+        f.write(ProfileResult(
+            batch_size=num_seqs,
+            block_size=block_size,
+            context_len=context_len,
+            dtype=str(dtype),
+            head_size=head_size,
+            num_kv_heads=num_kv_heads,
+            num_query_heads=num_query_heads,
+            profile=do_profile,
+            seed=seed,
+            use_alibi=use_alibi,
+            version=version,
+            latency_us=latency * 1000000,
+            throughput_seqs=num_seqs / latency,
+            throughput_kv_tokens=num_seqs * context_len / latency,
+            throughput_kv_MB=num_seqs * context_len / latency * n_bytes_per_token / 1000000,
+        ).to_csv_row() + "\n")
 
 
 if __name__ == '__main__':

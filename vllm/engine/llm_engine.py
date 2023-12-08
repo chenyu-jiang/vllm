@@ -120,6 +120,8 @@ class LLMEngine:
         self.num_prompt_tokens: List[Tuple[float, int]] = []
         # List of (timestamp, num_tokens)
         self.num_generation_tokens: List[Tuple[float, int]] = []
+        # List of (timestamp, step count)
+        self.num_steps: List[Tuple[float, int]] = []
 
     def _init_workers(self, distributed_init_method: str):
         # Lazy import the Worker to avoid importing torch.cuda/xformers
@@ -595,6 +597,7 @@ class LLMEngine:
             self.num_prompt_tokens.append((now, num_batched_tokens))
         else:
             self.num_generation_tokens.append((now, num_batched_tokens))
+            self.num_steps.append((now, 1))
 
         should_log = now - self.last_logging_time >= _LOGGING_INTERVAL_SEC
         if not should_log:
@@ -606,6 +609,8 @@ class LLMEngine:
         self.num_generation_tokens = [(t, n)
                                       for t, n in self.num_generation_tokens
                                       if now - t < _LOGGING_INTERVAL_SEC]
+        self.num_steps = [(t, n) for t, n in self.num_steps
+                            if now - t < _LOGGING_INTERVAL_SEC]
 
         if len(self.num_prompt_tokens) > 1:
             total_num_tokens = sum(n for _, n in self.num_prompt_tokens[:-1])
@@ -620,6 +625,12 @@ class LLMEngine:
             avg_generation_throughput = total_num_tokens / window
         else:
             avg_generation_throughput = 0.0
+        if len(self.num_steps) > 1:
+            total_num_steps = sum(n for _, n in self.num_steps[:-1])
+            window = now - self.num_steps[0][0]
+            avg_step_latency =  window / total_num_steps
+        else:
+            avg_step_latency = 0.0
 
         total_num_gpu_blocks = self.cache_config.num_gpu_blocks
         num_free_gpu_blocks = (
@@ -644,6 +655,7 @@ class LLMEngine:
             scheduler_waiting=len(self.scheduler.waiting),
             gpu_cache_usage=gpu_cache_usage,
             cpu_cache_usage=cpu_cache_usage,
+            avg_step_time=avg_step_latency * 1000,
         )
 
         logger.info("Avg prompt throughput: "
@@ -654,7 +666,8 @@ class LLMEngine:
                     f"Swapped: {len(self.scheduler.swapped)} reqs, "
                     f"Pending: {len(self.scheduler.waiting)} reqs, "
                     f"GPU KV cache usage: {gpu_cache_usage * 100:.1f}%, "
-                    f"CPU KV cache usage: {cpu_cache_usage * 100:.1f}%")
+                    f"CPU KV cache usage: {cpu_cache_usage * 100:.1f}%, "
+                    f"Avg step time: {avg_step_latency * 1000:.1f} ms")
         self.last_logging_time = now
 
     def _decode_sequence(self, seq: Sequence, prms: SamplingParams) -> None:

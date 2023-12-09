@@ -1,4 +1,5 @@
 """Benchmark offline inference throughput."""
+import os
 import argparse
 import json
 import random
@@ -70,6 +71,8 @@ def run_vllm(
     trust_remote_code: bool,
     dtype: str,
     max_model_len: Optional[int] = None,
+    gpu_memory_utilization: float = 0.9,
+    log_stats=False,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -81,7 +84,8 @@ def run_vllm(
         trust_remote_code=trust_remote_code,
         dtype=dtype,
         max_model_len=max_model_len,
-        disable_log_stats=False,
+        gpu_memory_utilization=gpu_memory_utilization,
+        disable_log_stats=not log_stats,
     )
 
     # Add the requests to the engine.
@@ -205,7 +209,9 @@ def main(args: argparse.Namespace):
                                 args.quantization, args.tensor_parallel_size,
                                 args.seed, args.n, args.use_beam_search,
                                 args.trust_remote_code, args.dtype,
-                                args.max_model_len)
+                                args.max_model_len,
+                                args.gpu_memory_utilization,
+                                args.log_stats)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -220,6 +226,13 @@ def main(args: argparse.Namespace):
                            for _, prompt_len, output_len in requests)
     print(f"Throughput: {len(requests) / elapsed_time:.2f} requests/s, "
           f"{total_num_tokens / elapsed_time:.2f} tokens/s")
+    if not os.path.exists("./throughput_vs_memory.csv"):
+        with open("./throughput_vs_memory.csv", "w") as f:
+            f.write("model,input_len,output_len,memory_frac,throughput_request,throughput_tokens\n")
+    with open("./throughput_vs_memory.csv", "a") as f:
+        f.write(f"{args.model},{args.input_len},{args.output_len},"
+                f"{args.gpu_memory_utilization},{len(requests) / elapsed_time},"
+                f"{total_num_tokens / elapsed_time}\n")
 
 
 if __name__ == "__main__":
@@ -280,6 +293,17 @@ if __name__ == "__main__":
         'The "auto" option will use FP16 precision '
         'for FP32 and FP16 models, and BF16 precision '
         'for BF16 models.')
+    parser.add_argument(
+        '--gpu-memory-utilization',
+        type=float,
+        default=0.9,
+        help='fraction of GPU memory to reserve.'
+    )
+    parser.add_argument(
+        '--log-stats',
+        action='store_true',
+        help='log statistics to stdout'
+    )
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model

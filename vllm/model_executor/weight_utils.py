@@ -4,7 +4,7 @@ import glob
 import json
 import os
 from collections import defaultdict
-from typing import Any, Iterator, List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Tuple, Callable
 
 from huggingface_hub import snapshot_download
 import numpy as np
@@ -182,6 +182,7 @@ def hf_model_weights_iterator(
     cache_dir: Optional[str] = None,
     load_format: str = "auto",
     revision: Optional[str] = None,
+    name_filter: Optional[Callable] = None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     use_safetensors = False
     use_np_cache = False
@@ -220,6 +221,10 @@ def hf_model_weights_iterator(
             if not os.path.exists(weight_names_file):
                 weight_names = []
                 for bin_file in hf_weights_files:
+                    if name_filter is not None:
+                        base_name = os.path.basename(bin_file)
+                        if not name_filter(base_name):
+                            continue
                     state = torch.load(bin_file, map_location="cpu")
                     for name, param in state.items():
                         param_path = os.path.join(np_folder, name)
@@ -239,12 +244,20 @@ def hf_model_weights_iterator(
             yield name, torch.from_numpy(param)
     elif use_safetensors:
         for st_file in hf_weights_files:
+            if name_filter is not None:
+                base_name = os.path.basename(bin_file)
+                if not name_filter(base_name):
+                    continue
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     param = f.get_tensor(name)
                     yield name, param
     else:
         for bin_file in hf_weights_files:
+            if name_filter is not None:
+                base_name = os.path.basename(bin_file)
+                if not name_filter(base_name):
+                    continue
             state = torch.load(bin_file, map_location="cpu")
             for name, param in state.items():
                 yield name, param

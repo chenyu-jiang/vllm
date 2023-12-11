@@ -2,7 +2,9 @@
 
 Run `pytest tests/models/test_models.py --forked`.
 """
+import asyncio
 import pytest
+from vllm.utils import MMInputType
 from vllm.sampling_params import SamplingParams
 
 MODELS = [
@@ -17,6 +19,10 @@ MODELS = [
     "bigscience/bloom-560m",
     "mosaicml/mpt-7b",
     "microsoft/phi-1_5",
+]
+
+MM_MODELS = [
+    "liuhaotian/llava-v1.5-7b",
 ]
 
 
@@ -87,3 +93,33 @@ def test_models_from_prompt_embeds(
                 f"output_prompt: {output_prompt.outputs[0].token_ids}\n",
                 f"output_embed: {output_embed.outputs[0].token_ids}",
             )
+
+
+@pytest.mark.parametrize("image", ["https://llava-vl.github.io/static/images/view.jpg"])
+@pytest.mark.parametrize("model", MM_MODELS)
+@pytest.mark.parametrize("dtype", ["half"])
+@pytest.mark.parametrize("max_tokens", [512])
+def test_multimodal_models(
+    mm_vllm_runner,
+    mm_example_prompts,
+    image: str,
+    model: str,
+    dtype: str,
+    max_tokens: int,
+) -> None:
+    vllm_model = mm_vllm_runner(model, dtype=dtype)
+
+    modality_inputs = [[(MMInputType.IMAGE, image)] 
+                        for _ in range(len(mm_example_prompts))]
+    outputs = asyncio.run(vllm_model.generate_greedy(mm_example_prompts,
+                                         max_tokens,
+                                         modality_inputs=modality_inputs))
+
+    del vllm_model
+    for (_, output_tokens) in outputs:
+        print("=" * 80)
+        assert "ASSISTANT:" in output_tokens
+        prompt = output_tokens.split("ASSISTANT:")[0]
+        response = output_tokens.split("ASSISTANT:")[1]
+        print(prompt)
+        print("ASSISTANT: " + response)

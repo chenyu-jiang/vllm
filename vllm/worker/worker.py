@@ -149,6 +149,10 @@ class Worker:
                                                  self.gpu_cache, cache_events)
         return output
 
+    @torch.inference_mode()
+    def embed_inputs(self, input_ids: List[int]) -> torch.Tensor:
+        return self.model_runner.embed_inputs(input_ids)
+
 
 def _init_distributed_environment(
     parallel_config: ParallelConfig,

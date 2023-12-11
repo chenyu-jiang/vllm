@@ -1,11 +1,14 @@
 import asyncio
+import traceback
 import time
 from functools import partial
 from typing import (Any, Dict, Iterable, List, Optional, Set, Tuple, Type,
-                    Union)
+                    Union, Callable)
 import torch
 
+from vllm.utils import MMInputType
 from vllm.config import ModelConfig
+from vllm.model_executor import get_multimodal_encoder
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.llm_engine import LLMEngine
 from vllm.engine.ray_utils import initialize_cluster, ray
@@ -36,6 +39,18 @@ def _raise_exception_on_finish(task: asyncio.Task,
     except Exception as exc:
         request_tracker.propagate_exception(exc)
         raise exc
+
+def _raise_exception_on_finish_encoders(task: asyncio.Task) -> None:
+    msg = ("Task finished unexpectedly. This should never happen! "
+           "Please open an issue on Github.")
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        traceback.print_exception(None, exc, exc.__traceback__)
+        exit(1)
+    raise AsyncEngineDeadError(msg)
 
 
 class AsyncStream:
@@ -198,6 +213,11 @@ class _AsyncLLMEngine(LLMEngine):
         )
 
         return self._process_model_outputs(output, scheduler_outputs) + ignored
+
+    async def embed_inputs_async(self, input_ids: List[int]) -> torch.Tensor:
+        """Embeds the inputs."""
+        output = await self._run_workers_async("embed_inputs", input_ids=input_ids)
+        return output
 
     async def _run_workers_async(
         self,
@@ -510,4 +530,220 @@ class AsyncLLMEngine:
                      log_stats=not engine_args.disable_log_stats,
                      max_log_len=engine_args.max_log_len,
                      start_engine_loop=start_engine_loop)
+        return engine
+
+
+class EncoderRequest:
+    def __init__(self, request_id: str,
+                 multimodal_inputs: List[Tuple[MMInputType, Any]]):
+        self.request_id = request_id
+        self.multimodal_inputs = multimodal_inputs
+        self.event = asyncio.Event()
+        self.encoded_result = [None for _ in range(len(multimodal_inputs))]
+        self.n_inputs_encoded = False
+
+    async def wait(self):
+        await self.event.wait()
+
+class AsyncMLLMEngine(AsyncLLMEngine):
+    """An wrapper around AsyncLLMEngine for multi-modal models.
+
+    This class is used to wrap the AsyncLLMEngine class, so additional
+    encoders can be executed to embed the multi-modal inputs before
+    sending them to the AsyncLLMEngine for decoding. The encoder
+    is executed in an asynchronous stream.
+
+    NOTE: For the comprehensive list of arguments, see `LLMEngine`.
+
+    Args:
+        start_encoders_loop: If True, the background task to run the encoders
+            will be automatically started in the generate call.
+        *args, *kwargs: Arguments for AsyncLLMEngine.
+    """
+    def __init__(self,
+                 *args,
+                 start_encoders_loop: bool = True,
+                 **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        model_config = self.engine.get_model_config()
+        # TODO: currently assume only one encoder
+        (encoder,
+         tokenize_and_postprocess_fn,
+         preprocess_and_collate_fn,
+         prompt_mixer) = get_multimodal_encoder(model_config)
+
+        self.modality_encoders = {MMInputType.IMAGE: encoder}
+        self.modality_encoders = {k: v.to("cuda") 
+                                  for k, v in self.modality_encoders.items()}
+        self.encoder_stream = torch.cuda.Stream()
+        self.tokenize_and_postprocess_fn = tokenize_and_postprocess_fn
+        self.preprocess_and_collate_fn = preprocess_and_collate_fn
+        self.prompt_mixer = prompt_mixer
+
+        self.tokenizer = self.engine.tokenizer
+        self.encoders_background_loop = None
+        # We need to keep a reference to unshielded
+        # task as well to prevent it from being garbage
+        # collected
+        self._encoders_background_loop_unshielded = None
+        self.start_encoders_loop = start_encoders_loop
+        self._encoders_requests = None
+
+    @property
+    def encoders_are_running(self) -> bool:
+        return (self.encoders_background_loop is not None
+                and not self.encoders_background_loop.done())
+
+    def start_encoders_background_loop(self) -> None:
+        """Start the encoders background loop."""
+        if self.encoders_are_running:
+            raise RuntimeError("Encoders background loop is already running.")
+
+        self._encoders_requests = asyncio.Queue()
+        self._encoders_background_loop_unshielded = asyncio.get_event_loop(
+        ).create_task(self.run_encoders_loop())
+        self._encoders_background_loop_unshielded.add_done_callback(
+            _raise_exception_on_finish_encoders)
+        self.encoders_background_loop = asyncio.shield(
+                                    self._encoders_background_loop_unshielded)
+
+    async def run_encoders_loop(self):
+        # Initialize the RequestTracker here so it uses the right event loop.
+        while True:
+            reqs: List[EncoderRequest] = []
+            req = await self._encoders_requests.get()
+            reqs.append(req)
+            # get more requests if there are any
+            while not self._encoders_requests.empty():
+                req = self._encoders_requests.get_nowait()
+                reqs.append(req)
+            await self.encoders_step(reqs)
+
+    async def encoders_step(self, reqs: List[EncoderRequest]) -> None:
+        """Run encoders to process the requests."""
+        # sort the requests by modality
+        reqs_by_modality = {}
+        for req in reqs:
+            for (
+                input_idx, (modality, req_input)
+            ) in enumerate(req.multimodal_inputs):
+                if modality not in reqs_by_modality:
+                    reqs_by_modality[modality] = {"reqs": [], "inputs": []}
+                reqs_by_modality[modality]["reqs"].append((req, input_idx))
+                reqs_by_modality[modality]["inputs"].append(req_input)
+        batched_reqs = {}
+        for modality, requests in reqs_by_modality.items():
+            batched_reqs[modality] = self.preprocess_and_collate_fn(
+                                        requests["inputs"])
+        # run encoders
+        encoded_results = {}
+        with torch.cuda.stream(self.encoder_stream):
+            for modality, req_inputs in batched_reqs.items():
+                encoded = self.modality_encoders[modality](req_inputs)
+                encoded_results[modality] = encoded
+        # we assume that the encoder returns a single tensor
+        # whose first dimension is the batch size
+        for (
+            batch_idx, (req, input_idx)
+            ) in enumerate(reqs_by_modality[modality]["reqs"]):
+            req.encoded_result[input_idx] = (modality, encoded[batch_idx])
+        # sync the stream
+        self.encoder_stream.synchronize()
+        for req in reqs:
+            req.event.set()
+
+    async def add_request(
+        self,
+        request_id: str,
+        prompt: Optional[str],
+        sampling_params: SamplingParams,
+        prompt_token_ids: Optional[List[int]] = None,
+        arrival_time: Optional[float] = None,
+        modality_inputs: Optional[List[Tuple[MMInputType, Any]]] = None,
+    ) -> AsyncStream:
+        if self.log_requests:
+            shortened_prompt = prompt
+            shortened_token_ids = prompt_token_ids
+            if self.max_log_len is not None:
+                if shortened_prompt is not None:
+                    shortened_prompt = shortened_prompt[:self.max_log_len]
+                if shortened_token_ids is not None:
+                    shortened_token_ids = shortened_token_ids[:self.
+                                                              max_log_len]
+            logger.info(f"Received request {request_id}: "
+                        f"prompt: {shortened_prompt!r}, "
+                        f"sampling params: {sampling_params}, "
+                        f"prompt token ids: {shortened_token_ids}.")
+
+        if not self.is_running:
+            if self.start_engine_loop:
+                self.start_background_loop()
+            else:
+                raise AsyncEngineDeadError(
+                    "Background loop is not running. If it was running, "
+                    "inspect the output to find the stacktrace of the "
+                    "error that caused the background loop to stop "
+                    "(AsyncEngineDeadError).")
+        if not self.encoders_are_running:
+            if self.start_encoders_loop:
+                self.start_encoders_background_loop()
+            else:
+                raise AsyncEngineDeadError(
+                    "Encoders background loop is not running. "
+                    "If it was running, inspect the output to find the "
+                    "stacktrace of the error that caused the background loop "
+                    "to stop (AsyncEngineDeadError).")
+
+        if modality_inputs is not None:
+            # add the request to the encoder queue
+            req = EncoderRequest(request_id, modality_inputs)
+            self._encoders_requests.put_nowait(req)
+            # tokenize the prompt if necessary
+            if prompt_token_ids is None:
+                prompt_token_ids = self.tokenize_and_postprocess_fn(prompt,
+                                                               self.tokenizer)
+            # wait for the encoder to finish
+            await req.wait()
+            # get the prompt embeds
+            prompt_ids_for_emb = [max(0, x) for x in prompt_token_ids]
+            prompt_embeds = await self.engine.embed_inputs_async(prompt_ids_for_emb)
+            prompt_embeds = self.prompt_mixer(prompt_token_ids, prompt_embeds, req.encoded_result)
+        else:
+            prompt_embeds = None
+
+        stream = self._request_tracker.add_request(
+            request_id,
+            prompt=prompt,
+            sampling_params=sampling_params,
+            prompt_token_ids=prompt_token_ids,
+            arrival_time=arrival_time,
+            prompt_embeds=prompt_embeds,
+        )
+
+        return stream
+
+    @classmethod
+    def from_engine_args(cls,
+                        engine_args: AsyncEngineArgs,
+                        start_engine_loop: bool = True,
+                        start_encoders_loop: bool = True
+                        ) -> "AsyncMLLMEngine":
+        """Creates an async MLLM engine from the engine arguments."""
+        # Create the engine configs.
+        engine_configs = engine_args.create_engine_configs()
+        parallel_config = engine_configs[2]
+        # Initialize the cluster.
+        distributed_init_method, placement_group = initialize_cluster(
+            parallel_config, engine_args.engine_use_ray)
+        # Create the async LLM engine.
+        engine = cls(parallel_config.worker_use_ray,
+                     engine_args.engine_use_ray,
+                     *engine_configs,
+                     distributed_init_method,
+                     placement_group,
+                     log_requests=not engine_args.disable_log_requests,
+                     log_stats=not engine_args.disable_log_stats,
+                     max_log_len=engine_args.max_log_len,
+                     start_engine_loop=start_engine_loop,
+                     start_encoders_loop=start_encoders_loop)
         return engine

@@ -75,6 +75,12 @@ def get_tokenizer(
         else:
             raise e
 
+    if "llava" in tokenizer_name.lower():
+        hf_config = kwargs.get("hf_config", None)
+        assert hf_config is not None, (
+            "The LLaVA tokenizer requires a HuggingFace config.")
+        tokenizer = llava_add_special_tokens(hf_config, tokenizer)
+
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         logger.warning(
             "Using a slow tokenizer. This might cause a significant "

@@ -52,10 +52,11 @@ from vllm.model_executor.weight_utils import (
     hf_model_weights_iterator,
 )
 from vllm.sequence import SamplerOutput
+from vllm.logger import init_logger
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
-
+logger = init_logger(__name__)
 class LlamaMLP(nn.Module):
 
     def __init__(
@@ -338,6 +339,7 @@ class LlamaForCausalLM(nn.Module):
         cache_dir: Optional[str] = None,
         load_format: str = "auto",
         revision: Optional[str] = None,
+        name_filter: Optional[str] = None,
     ):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -349,7 +351,8 @@ class LlamaForCausalLM(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path, cache_dir, load_format, revision):
+                model_name_or_path, cache_dir, load_format, revision,
+                name_filter):
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name:
@@ -364,6 +367,12 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                if name not in params_dict:
+                    if "mm_projector" not in name:
+                        # mm_projector should be ignored when loading an
+                        # LLaVA model
+                        logger.warning(f"Ignoring extra param with name {name}.")
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)

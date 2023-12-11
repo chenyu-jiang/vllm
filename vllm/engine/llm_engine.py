@@ -101,7 +101,8 @@ class LLMEngine:
             tokenizer_mode=model_config.tokenizer_mode,
             trust_remote_code=model_config.trust_remote_code,
             tokenizer_revision=model_config.tokenizer_revision,
-            revision=model_config.revision)
+            revision=model_config.revision,
+            hf_config=model_config.hf_config,)
         self.seq_counter = Counter()
 
         # Create the parallel GPU workers.
@@ -698,6 +699,10 @@ class LLMEngine:
         seq.prefix_offset = prefix_offset
         seq.read_offset = read_offset
         seq.output_text += new_output_text
+
+    def embed_inputs(self, input_ids: List[int]) -> torch.Tensor:
+        """Embeds the inputs."""
+        return self._run_workers("embed_inputs", input_ids=input_ids)
 
     def _check_stop(self, seq: Sequence,
                     sampling_params: SamplingParams) -> None:

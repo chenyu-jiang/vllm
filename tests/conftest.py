@@ -1,10 +1,14 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any
 
 import pytest
 import torch
+import argparse
 from transformers import AutoModelForCausalLM
 
 from vllm import LLM, SamplingParams
+from vllm.utils import Counter, MMInputType
+from vllm.engine.async_llm_engine import AsyncMLLMEngine, AsyncEngineArgs, \
+                                         AsyncStream
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
 _TEST_PROMPTS = [
@@ -18,10 +22,31 @@ _TEST_PROMPTS = [
     "Translate the following English sentence into Japanese, French, and Swahili: 'The early bird catches the worm.'",
 ]
 
+_MM_TEST_PROMPTS = [
+    "What are the recommended things to do at this place?",
+    "What should I be careful about when I visit this place?",
+    "Describe the major attractions of this place.",
+    "Describe the picture.",
+    "What is the name of this place?",
+    "Can you write a diary about a visit to this place for me?",
+    "What is the weather like as shown in the picture?",
+]
+
+def _mm_test_template(prompt: str) -> str:
+    response= ("A chat between a curious human and an artificial intelligence "
+               "assistant. The assistant gives helpful, detailed, and polite "
+               "answers to the human's questions. USER: <image>\n"
+               f"{prompt} ASSISTANT:")
+    return response
+
 
 @pytest.fixture
 def example_prompts() -> List[str]:
     return _TEST_PROMPTS
+
+@pytest.fixture
+def mm_example_prompts() -> List[str]:
+    return [_mm_test_template(prompt) for prompt in _MM_TEST_PROMPTS]
 
 
 _STR_DTYPE_TO_TORCH_DTYPE = {
@@ -216,7 +241,98 @@ class VllmRunner:
                                 prompt_embeds=prompt_embeds)
         return outputs
 
+class MultimodalVllmRunner:
+    def __init__(
+        self,
+        model_name: str,
+        tokenizer_name: Optional[str] = None,
+        dtype: str = "half",
+    ) -> None:
+        parser = argparse.ArgumentParser()
+        parser = AsyncEngineArgs.add_cli_args(parser)
+        args = parser.parse_args([])
+
+        args.model = model_name
+        args.tokenizer = tokenizer_name
+        args.swap_space = 0
+        args.trust_remote_code = True
+        args.dtype = dtype
+
+        args.gpu_memory_utilization = 0.5
+
+        engine_args = AsyncEngineArgs.from_cli_args(args)
+        self.async_engine = AsyncMLLMEngine.from_engine_args(engine_args)
+        self.request_counter = Counter()
+
+    async def generate(
+        self,
+        prompts: List[str],
+        sampling_params: SamplingParams,
+        modality_inputs: List[List[Tuple[MMInputType, Any]]] = None,
+    ) -> List[Tuple[List[int], str]]:
+        if modality_inputs is not None:
+            assert len(prompts) == len(modality_inputs)
+        req_outputs: List[AsyncStream] = []
+        for prompt, mm_inputs in zip(prompts, modality_inputs):
+            request_id = str(next(self.request_counter))
+            req_output = await self.async_engine.add_request(request_id,
+                                                        prompt,
+                                                        sampling_params,
+                                                        modality_inputs=mm_inputs)
+            req_outputs.append(req_output)
+        outputs = []
+        for req_stream in req_outputs:
+            final_output = None
+            async for request_output in req_stream:
+                final_output = request_output
+            prompt_str = final_output.prompt
+            prompt_ids = final_output.prompt_token_ids
+            req_sample_output_ids = []
+            req_sample_output_strs = []
+            for sample in final_output.outputs:
+                output_str = sample.text
+                output_ids = sample.token_ids
+                req_sample_output_ids.append(prompt_ids + output_ids)
+                req_sample_output_strs.append(prompt_str + output_str)
+                req_sample_output_strs.append(output_str)
+            outputs.append((req_sample_output_ids, req_sample_output_strs))
+        return outputs
+
+    async def generate_greedy(
+        self,
+        prompts: List[str],
+        max_tokens: int,
+        modality_inputs: List[List[Tuple[MMInputType, Any]]] = None,
+    ) -> List[Tuple[List[int], str]]:
+        greedy_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
+        outputs = await self.generate(prompts,
+                                greedy_params,
+                                modality_inputs=modality_inputs)
+        return [(output_ids[0], output_str[0])
+                for output_ids, output_str in outputs]
+
+    async def generate_beam_search(
+        self,
+        prompts: List[str],
+        beam_width: int,
+        max_tokens: int,
+        modality_inputs: List[List[Tuple[MMInputType, Any]]] = None,
+    ) -> List[Tuple[List[int], str]]:
+        beam_search_params = SamplingParams(n=beam_width,
+                                            use_beam_search=True,
+                                            temperature=0.0,
+                                            max_tokens=max_tokens)
+        outputs = await self.generate(prompts,
+                                beam_search_params,
+                                modality_inputs=modality_inputs)
+        return outputs
+
 
 @pytest.fixture
 def vllm_runner():
     return VllmRunner
+
+
+@pytest.fixture
+def mm_vllm_runner():
+    return MultimodalVllmRunner

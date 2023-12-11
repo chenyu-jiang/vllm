@@ -1,6 +1,6 @@
 """Utilities for selecting and loading models."""
 import contextlib
-from typing import Type
+from typing import Type, Tuple, Callable
 
 import torch
 import torch.nn as nn
@@ -32,6 +32,7 @@ _MODEL_REGISTRY = {
     "InternLMForCausalLM": InternLMForCausalLM,
     "LlamaForCausalLM": LlamaForCausalLM,
     "LLaMAForCausalLM": LlamaForCausalLM,  # For decapoda-research/llama-*
+    "LlavaLlamaForCausalLM": LlamaForCausalLM,
     "MistralForCausalLM": MistralForCausalLM,
     # transformers's mpt class has lower case
     "MptForCausalLM": MPTForCausalLM,
@@ -41,6 +42,24 @@ _MODEL_REGISTRY = {
     "QWenLMHeadModel": QWenLMHeadModel,
     "RWForCausalLM": FalconForCausalLM,
     "YiForCausalLM": YiForCausalLM,
+}
+
+_NAME_FILTER_REGISTRY = {
+    "LlavaLlamaForCausalLM": lambda x: not x.startswith("mm_projector"),
+}
+
+_ENCODER_REGISTRY = {
+    "LlavaLlamaForCausalLM": LLaVAVisionEncoder,
+}
+
+_TOKENIZE_POSTPROCESS_FN_REGISTRY = {
+    "LlavaLlamaForCausalLM": llava_tokenize_and_postprocess_fn,
+}
+_PREPROCESS_COLLATE_FN_REGISTRY = {
+    "LlavaLlamaForCausalLM": get_llava_preprocess_and_collate_fn,
+}
+_PROMPT_MIXER_FN_REGISTRY = {
+    "LlavaLlamaForCausalLM": llava_prompt_mixer,
 }
 
 # Models to be disabled in ROCm
@@ -82,6 +101,49 @@ def _get_model_architecture(config: PretrainedConfig) -> Type[nn.Module]:
         f"Model architectures {architectures} are not supported for now. "
         f"Supported architectures: {list(_MODEL_REGISTRY.keys())}")
 
+def _get_name_filter_fn(config: PretrainedConfig) -> Callable[[str], bool]:
+    architectures = getattr(config, "architectures", [])
+    for arch in architectures:
+        if arch in _NAME_FILTER_REGISTRY:
+            return _NAME_FILTER_REGISTRY[arch]
+    return lambda x: True
+
+def _get_encoder_architecture(config: PretrainedConfig) -> Type[nn.Module]:
+    architectures = getattr(config, "architectures", [])
+    for arch in architectures:
+        if arch in _ENCODER_REGISTRY:
+            return _ENCODER_REGISTRY[arch]
+    raise ValueError(
+        f"Encoder model architectures {architectures} are not supported for now. "
+        f"Supported architectures: {list(_ENCODER_REGISTRY.keys())}")
+
+def _get_tokenize_and_postprocess_fn(config: PretrainedConfig):
+    architectures = getattr(config, "architectures", [])
+    for arch in architectures:
+        if arch in _TOKENIZE_POSTPROCESS_FN_REGISTRY:
+            return _TOKENIZE_POSTPROCESS_FN_REGISTRY[arch]
+    raise ValueError(
+        f"Model architectures {architectures} are not supported for now. "
+        f"Supported architectures: {list(_TOKENIZE_POSTPROCESS_FN_REGISTRY.keys())}")
+
+def _get_preprocess_and_collate_fn(config: PretrainedConfig):
+    architectures = getattr(config, "architectures", [])
+    for arch in architectures:
+        if arch in _PREPROCESS_COLLATE_FN_REGISTRY:
+            return _PREPROCESS_COLLATE_FN_REGISTRY[arch]
+    raise ValueError(
+        f"Model architectures {architectures} are not supported for now. "
+        f"Supported architectures: {list(_PREPROCESS_COLLATE_FN_REGISTRY.keys())}")
+
+def _get_prompt_mixer_fn(config: PretrainedConfig):
+    architectures = getattr(config, "architectures", [])
+    for arch in architectures:
+        if arch in _PROMPT_MIXER_FN_REGISTRY:
+            return _PROMPT_MIXER_FN_REGISTRY[arch]
+    raise ValueError(
+        f"Model architectures {architectures} are not supported for now. "
+        f"Supported architectures: {list(_PROMPT_MIXER_FN_REGISTRY.keys())}")
+
 
 def get_model(model_config: ModelConfig) -> nn.Module:
     model_class = _get_model_architecture(model_config.hf_config)
@@ -120,6 +182,30 @@ def get_model(model_config: ModelConfig) -> nn.Module:
             initialize_dummy_weights(model)
         else:
             # Load the weights from the cached or downloaded files.
+            name_filter = _get_name_filter_fn(model_config.hf_config)
+            model.load_weights(model_config.model, model_config.download_dir,
+                               model_config.load_format, model_config.revision,
+                               name_filter)
+    return model.eval()
+
+def get_multimodal_encoder(model_config: ModelConfig
+                           ) -> Tuple[nn.Module, Callable, Callable, Callable]:
+    model_class = _get_encoder_architecture(model_config.hf_config)
+
+    with _set_default_torch_dtype(model_config.dtype):
+        # Create a model instance.
+        # The weights will be initialized as empty tensors.
+        with torch.device("cuda"):
+            model = model_class(model_config.hf_config)
+        if model_config.load_format == "dummy":
+            # NOTE(woosuk): For accurate performance evaluation, we assign
+            # random values to the weights.
+            initialize_dummy_weights(model)
+        else:
+            # Load the weights from the cached or downloaded files.
             model.load_weights(model_config.model, model_config.download_dir,
                                model_config.load_format, model_config.revision)
-    return model.eval()
+        tokenize_fn = _get_tokenize_and_postprocess_fn(model_config.hf_config)
+        collate_fn = _get_preprocess_and_collate_fn(model_config.hf_config)(model)
+        mixer_fn = _get_prompt_mixer_fn(model_config.hf_config)
+    return model.eval(), tokenize_fn, collate_fn, mixer_fn

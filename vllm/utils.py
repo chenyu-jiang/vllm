@@ -12,6 +12,8 @@ class Device(enum.Enum):
     GPU = enum.auto()
     CPU = enum.auto()
 
+class MMInputType(enum.Enum):
+    IMAGE = enum.auto()
 
 class Counter:
 

@@ -329,6 +329,11 @@ class ModelRunner:
         return output
 
     @torch.inference_mode()
+    def embed_inputs(self, input_ids: List[int]) -> torch.Tensor:
+        input_ids = torch.tensor(input_ids, dtype=torch.long, device="cuda")
+        return self.model.get_input_embeddings()(input_ids)
+
+    @torch.inference_mode()
     def profile_run(self) -> None:
         # Enable top-k sampling to reflect the accurate memory usage.
         vocab_size = self.model_config.get_vocab_size()

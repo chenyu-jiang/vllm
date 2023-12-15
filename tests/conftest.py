@@ -258,8 +258,6 @@ class MultimodalVllmRunner:
         args.trust_remote_code = True
         args.dtype = dtype
 
-        args.gpu_memory_utilization = 0.5
-
         engine_args = AsyncEngineArgs.from_cli_args(args)
         self.async_engine = AsyncMLLMEngine.from_engine_args(engine_args)
         self.request_counter = Counter()

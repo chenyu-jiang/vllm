@@ -562,6 +562,8 @@ class AsyncMLLMEngine(AsyncLLMEngine):
     """
     def __init__(self,
                  *args,
+                 encoder_max_batch_size: int = 32,
+                 encoder_max_pending_requests: int = 16,
                  start_encoders_loop: bool = True,
                  **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -580,6 +582,9 @@ class AsyncMLLMEngine(AsyncLLMEngine):
         self.preprocess_and_collate_fn = preprocess_and_collate_fn
         self.prompt_mixer = prompt_mixer
 
+        self.encoder_max_batch_size = encoder_max_batch_size
+        self.encoder_max_pending_requests = encoder_max_pending_requests
+
         self.tokenizer = self.engine.tokenizer
         self.encoders_background_loop = None
         # We need to keep a reference to unshielded
@@ -588,6 +593,7 @@ class AsyncMLLMEngine(AsyncLLMEngine):
         self._encoders_background_loop_unshielded = None
         self.start_encoders_loop = start_encoders_loop
         self._encoders_requests = None
+        self._encoded_and_unsubmitted_requests = 0
 
     @property
     def encoders_are_running(self) -> bool:
@@ -611,14 +617,27 @@ class AsyncMLLMEngine(AsyncLLMEngine):
         # Initialize the RequestTracker here so it uses the right event loop.
         while True:
             reqs: List[EncoderRequest] = []
+            # check vLLM engine's block usage
+            if (len(self.engine.scheduler.waiting) 
+                    + self._encoded_and_unsubmitted_requests
+                    >= self.encoder_max_pending_requests):
+                # wait for requests to finish
+                await asyncio.sleep(0.1)
+                continue
             req = await self._encoders_requests.get()
             reqs.append(req)
             # get more requests if there are any
             while not self._encoders_requests.empty():
+                if len(reqs) >= self.encoder_max_batch_size:
+                    break
                 req = self._encoders_requests.get_nowait()
                 reqs.append(req)
+            self._encoded_and_unsubmitted_requests += len(reqs)
             await self.encoders_step(reqs)
+            # IMPORTANT: yield control to vLLM engine
+            await asyncio.sleep(0)
 
+    @torch.inference_mode()
     async def encoders_step(self, reqs: List[EncoderRequest]) -> None:
         """Run encoders to process the requests."""
         # sort the requests by modality
@@ -636,17 +655,16 @@ class AsyncMLLMEngine(AsyncLLMEngine):
             batched_reqs[modality] = self.preprocess_and_collate_fn(
                                         requests["inputs"])
         # run encoders
-        encoded_results = {}
         with torch.cuda.stream(self.encoder_stream):
             for modality, req_inputs in batched_reqs.items():
                 encoded = self.modality_encoders[modality](req_inputs)
-                encoded_results[modality] = encoded
-        # we assume that the encoder returns a single tensor
-        # whose first dimension is the batch size
-        for (
-            batch_idx, (req, input_idx)
-            ) in enumerate(reqs_by_modality[modality]["reqs"]):
-            req.encoded_result[input_idx] = (modality, encoded[batch_idx])
+                # we assume that the encoder returns a single tensor
+                # whose first dimension is the batch size
+                for (
+                    batch_idx, (req, input_idx)
+                    ) in enumerate(reqs_by_modality[modality]["reqs"]):
+                    sliced_features = encoded[batch_idx]
+                    req.encoded_result[input_idx] = (modality, sliced_features)
         # sync the stream
         self.encoder_stream.synchronize()
         for req in reqs:
@@ -710,7 +728,7 @@ class AsyncMLLMEngine(AsyncLLMEngine):
             prompt_embeds = self.prompt_mixer(prompt_token_ids, prompt_embeds, req.encoded_result)
         else:
             prompt_embeds = None
-
+        self._encoded_and_unsubmitted_requests -= 1
         stream = self._request_tracker.add_request(
             request_id,
             prompt=prompt,
@@ -726,7 +744,9 @@ class AsyncMLLMEngine(AsyncLLMEngine):
     def from_engine_args(cls,
                         engine_args: AsyncEngineArgs,
                         start_engine_loop: bool = True,
-                        start_encoders_loop: bool = True
+                        start_encoders_loop: bool = True,
+                        encoder_max_batch_size: int = 32,
+                        encoder_max_pending_requests: int = 16,
                         ) -> "AsyncMLLMEngine":
         """Creates an async MLLM engine from the engine arguments."""
         # Create the engine configs.
@@ -745,5 +765,7 @@ class AsyncMLLMEngine(AsyncLLMEngine):
                      log_stats=not engine_args.disable_log_stats,
                      max_log_len=engine_args.max_log_len,
                      start_engine_loop=start_engine_loop,
-                     start_encoders_loop=start_encoders_loop)
+                     start_encoders_loop=start_encoders_loop,
+                     encoder_max_batch_size=encoder_max_batch_size,
+                     encoder_max_pending_requests=encoder_max_pending_requests)
         return engine

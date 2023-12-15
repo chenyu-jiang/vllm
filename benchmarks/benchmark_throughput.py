@@ -215,8 +215,10 @@ def main(args: argparse.Namespace):
                                args.output_len)
     else:
         raise ValueError(f"Unknown backend: {args.backend}")
-    total_num_tokens = sum(prompt_len + output_len
-                           for _, prompt_len, output_len in requests)
+    # total_num_tokens = sum(prompt_len + output_len
+    #                        for _, prompt_len, output_len in requests)
+    total_num_tokens = sum(output_len
+                           for _, _, output_len in requests)
     print(f"Throughput: {len(requests) / elapsed_time:.2f} requests/s, "
           f"{total_num_tokens / elapsed_time:.2f} tokens/s")
 

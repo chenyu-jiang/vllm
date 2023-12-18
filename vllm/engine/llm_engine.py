@@ -71,6 +71,7 @@ class LLMEngine:
         distributed_init_method: str,
         placement_group: Optional["PlacementGroup"],
         log_stats: bool,
+        profile_time_proportion: bool,
     ) -> None:
         logger.info(
             "Initializing an LLM engine with config: "
@@ -95,6 +96,7 @@ class LLMEngine:
         self.scheduler_config = scheduler_config
         self.log_stats = log_stats
         self._verify_args()
+        print("profile_time_proportion: ", profile_time_proportion)
 
         self.tokenizer = get_tokenizer(
             model_config.tokenizer,
@@ -104,6 +106,9 @@ class LLMEngine:
             revision=model_config.revision,
             hf_config=model_config.hf_config,)
         self.seq_counter = Counter()
+        self.profile_time_proportion = profile_time_proportion
+        self._decode_time = 0.0
+        self._prompt_time = 0.0
 
         # Create the parallel GPU workers.
         if self.parallel_config.worker_use_ray:
@@ -590,6 +595,8 @@ class LLMEngine:
             return ignored
 
         # Execute the model.
+        if self.profile_time_proportion:
+            start = time.perf_counter()
         output = self._run_workers(
             "execute_model",
             seq_group_metadata_list=seq_group_metadata_list,
@@ -597,6 +604,13 @@ class LLMEngine:
             blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
             blocks_to_copy=scheduler_outputs.blocks_to_copy,
         )
+        if self.profile_time_proportion:
+            torch.cuda.synchronize()
+            end = time.perf_counter()
+            if scheduler_outputs.prompt_run:
+                self._prompt_time += end - start
+            else:
+                self._decode_time += end - start
 
         return self._process_model_outputs(output, scheduler_outputs)
 

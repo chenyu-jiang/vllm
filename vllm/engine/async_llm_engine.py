@@ -204,6 +204,8 @@ class _AsyncLLMEngine(LLMEngine):
             return ignored
 
         # Execute the model.
+        if self.profile_time_proportion:
+            start = time.perf_counter()
         output = await self._run_workers_async(
             "execute_model",
             seq_group_metadata_list=seq_group_metadata_list,
@@ -211,6 +213,13 @@ class _AsyncLLMEngine(LLMEngine):
             blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
             blocks_to_copy=scheduler_outputs.blocks_to_copy,
         )
+        if self.profile_time_proportion:
+            torch.cuda.synchronize()
+            end = time.perf_counter()
+            if scheduler_outputs.prompt_run:
+                self._prompt_time += end - start
+            else:
+                self._decode_time += end - start
 
         return self._process_model_outputs(output, scheduler_outputs) + ignored
 
@@ -282,12 +291,16 @@ class AsyncLLMEngine:
                  log_requests: bool = True,
                  max_log_len: Optional[int] = None,
                  start_engine_loop: bool = True,
+                 profile_time_proportion: bool = False,
                  **kwargs) -> None:
         self.worker_use_ray = worker_use_ray
         self.engine_use_ray = engine_use_ray
         self.log_requests = log_requests
         self.max_log_len = max_log_len
+        kwargs["profile_time_proportion"] = profile_time_proportion
         self.engine = self._init_engine(*args, **kwargs)
+
+        self.profile_time_proportion = profile_time_proportion
 
         self.background_loop = None
         # We need to keep a reference to unshielded
@@ -512,7 +525,9 @@ class AsyncLLMEngine:
     @classmethod
     def from_engine_args(cls,
                          engine_args: AsyncEngineArgs,
-                         start_engine_loop: bool = True) -> "AsyncLLMEngine":
+                         start_engine_loop: bool = True,
+                         profile_time_proportion: bool = False,
+                         ) -> "AsyncLLMEngine":
         """Creates an async LLM engine from the engine arguments."""
         # Create the engine configs.
         engine_configs = engine_args.create_engine_configs()
@@ -529,7 +544,8 @@ class AsyncLLMEngine:
                      log_requests=not engine_args.disable_log_requests,
                      log_stats=not engine_args.disable_log_stats,
                      max_log_len=engine_args.max_log_len,
-                     start_engine_loop=start_engine_loop)
+                     start_engine_loop=start_engine_loop,
+                     profile_time_proportion=profile_time_proportion)
         return engine
 
 
@@ -595,6 +611,8 @@ class AsyncMLLMEngine(AsyncLLMEngine):
         self._encoders_requests = None
         self._encoded_and_unsubmitted_requests = 0
 
+        self._encoder_time = 0.0
+
     @property
     def encoders_are_running(self) -> bool:
         return (self.encoders_background_loop is not None
@@ -655,6 +673,8 @@ class AsyncMLLMEngine(AsyncLLMEngine):
             batched_reqs[modality] = self.preprocess_and_collate_fn(
                                         requests["inputs"])
         # run encoders
+        if self.profile_time_proportion:
+            start = time.perf_counter()
         with torch.cuda.stream(self.encoder_stream):
             for modality, req_inputs in batched_reqs.items():
                 encoded = self.modality_encoders[modality](req_inputs)
@@ -667,8 +687,21 @@ class AsyncMLLMEngine(AsyncLLMEngine):
                     req.encoded_result[input_idx] = (modality, sliced_features)
         # sync the stream
         self.encoder_stream.synchronize()
+        if self.profile_time_proportion:
+            end = time.perf_counter()
+            self._encoder_time += end - start
         for req in reqs:
             req.event.set()
+
+    def get_time_proportion_stats(self) -> Dict[str, float]:
+        """Get the time proportion stats."""
+        assert self.profile_time_proportion, (
+            "Time proportion profiling is not enabled.")
+        stats = {}
+        stats["encoder_time"] = self._encoder_time
+        stats["prompt_time"] = self.engine._prompt_time
+        stats["decode_time"] = self.engine._decode_time
+        return stats
 
     async def add_request(
         self,
@@ -747,6 +780,7 @@ class AsyncMLLMEngine(AsyncLLMEngine):
                         start_encoders_loop: bool = True,
                         encoder_max_batch_size: int = 32,
                         encoder_max_pending_requests: int = 16,
+                        profile_time_proportion: bool = False,
                         ) -> "AsyncMLLMEngine":
         """Creates an async MLLM engine from the engine arguments."""
         # Create the engine configs.
@@ -767,5 +801,6 @@ class AsyncMLLMEngine(AsyncLLMEngine):
                      start_engine_loop=start_engine_loop,
                      start_encoders_loop=start_encoders_loop,
                      encoder_max_batch_size=encoder_max_batch_size,
-                     encoder_max_pending_requests=encoder_max_pending_requests)
+                     encoder_max_pending_requests=encoder_max_pending_requests,
+                     profile_time_proportion=profile_time_proportion)
         return engine

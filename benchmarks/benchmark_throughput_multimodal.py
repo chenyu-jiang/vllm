@@ -4,7 +4,7 @@ import argparse
 import json
 import random
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import torch
 from transformers import AutoTokenizer
@@ -31,7 +31,8 @@ def run_vllm(
     max_model_len: Optional[int] = None,
     encoder_max_batch_size: int = 4,
     encoder_max_pending_requests: int = 16,
-) -> float:
+    gpu_memory_utilization: float = 0.9,
+) -> Tuple[float, Dict]:
     from vllm import AsyncMLLMEngine, SamplingParams, AsyncEngineArgs
     from vllm.utils import MMInputType
     from vllm.engine.async_llm_engine import AsyncStream
@@ -54,16 +55,16 @@ def run_vllm(
     args.max_model_len = max_model_len
     args.disable_log_stats = False
     args.disable_log_requests = True
+    args.gpu_memory_utilization = gpu_memory_utilization
 
     engine_args = AsyncEngineArgs.from_cli_args(args)
     async_engine = AsyncMLLMEngine.from_engine_args(engine_args,
                                                     encoder_max_batch_size=encoder_max_batch_size,
-                                                    encoder_max_pending_requests=encoder_max_pending_requests)
+                                                    encoder_max_pending_requests=encoder_max_pending_requests,
+                                                    profile_time_proportion=True)
 
-    total_generated_tokens = 0
     # Add the requests to the engine.
     async def _run():
-        nonlocal total_generated_tokens
         tasks: List[Task[AsyncStream]] = []
         for req_id, (prompt, image, output_len) in enumerate(requests):
             sampling_params = SamplingParams(
@@ -88,24 +89,13 @@ def run_vllm(
             final_output = None
             async for request_output in req_stream:
                 final_output = request_output
-        #     prompt_str = final_output.prompt
-        #     prompt_ids = final_output.prompt_token_ids
-        #     req_sample_output_ids = []
-        #     req_sample_output_strs = []
-        #     for sample in final_output.outputs:
-        #         output_str = sample.text
-        #         output_ids = sample.token_ids
-        #         req_sample_output_ids.append(prompt_ids + output_ids)
-        #         req_sample_output_strs.append(prompt_str + output_str)
-        #         total_generated_tokens += len(output_ids)
-        #     outputs.append((req_sample_output_ids, req_sample_output_strs))
-        # print("Output:", outputs[0][1][0])
         return outputs
 
     start = time.perf_counter()
     asyncio.run(_run())
     end = time.perf_counter()
-    return end - start, total_generated_tokens
+
+    return end - start, async_engine.get_time_proportion_stats()
 
 
 def main(args: argparse.Namespace):
@@ -127,16 +117,23 @@ def main(args: argparse.Namespace):
         # requests = sample_requests(args.dataset, args.num_prompts, tokenizer,
         #                            args.output_len)
 
-    elapsed_time, total_generated_tokens = run_vllm(requests, args.model, args.tokenizer,
+    elapsed_time, time_stats = run_vllm(requests, args.model, args.tokenizer,
                             args.quantization, args.tensor_parallel_size,
                             args.seed, args.n, args.use_beam_search,
                             args.trust_remote_code, args.dtype,
-                            args.max_model_len)
+                            args.max_model_len,
+                            args.encoder_max_batch_size,
+                            encoder_max_pending_requests=args.encoder_max_pending_requests,
+                            gpu_memory_utilization=args.gpu_memory_utilization)
     total_num_tokens = sum(output_len
                            for _, _, output_len in requests)
     print("Elapsed time: {:.2f} s".format(elapsed_time))
     print(f"Throughput: {len(requests) / elapsed_time:.2f} requests/s, "
           f"{total_num_tokens / elapsed_time:.2f} tokens/s")
+    total_time = sum(time_stats.values())
+    print("Time proportion stats:")
+    for k, v in time_stats.items():
+        print(f"{k}: {v / total_time:.2f}")
 
 
 if __name__ == "__main__":
@@ -178,6 +175,12 @@ if __name__ == "__main__":
                         type=int,
                         default=1000,
                         help="Number of prompts to process.")
+    parser.add_argument("--encoder-max-batch-size", type=int, default=4,
+                        help="Maximum batch size for the encoder")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+                        help="Fraction of GPU memory to use.")
+    parser.add_argument("--encoder-max-pending-requests", type=int, default=16,
+                        help="Maximum number of pending requests for the encoder")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument('--trust-remote-code',
                         action='store_true',

@@ -71,6 +71,7 @@ def run_vllm(
     dtype: str,
     max_model_len: Optional[int],
     enforce_eager: bool,
+    max_num_seqs: int = 256,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -83,6 +84,8 @@ def run_vllm(
         dtype=dtype,
         max_model_len=max_model_len,
         enforce_eager=enforce_eager,
+        disable_log_stats=False,
+        max_num_seqs=max_num_seqs,
     )
 
     # Add the requests to the engine.
@@ -206,7 +209,8 @@ def main(args: argparse.Namespace):
                                 args.quantization, args.tensor_parallel_size,
                                 args.seed, args.n, args.use_beam_search,
                                 args.trust_remote_code, args.dtype,
-                                args.max_model_len, args.enforce_eager)
+                                args.max_model_len, args.enforce_eager,
+                                args.max_num_seqs)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -266,6 +270,8 @@ if __name__ == "__main__":
     parser.add_argument('--trust-remote-code',
                         action='store_true',
                         help='trust remote code from huggingface')
+    parser.add_argument("--max-num-seqs", type=int, default=256,
+                        help="Max number of sequences to process in one batch.")
     parser.add_argument(
         '--max-model-len',
         type=int,

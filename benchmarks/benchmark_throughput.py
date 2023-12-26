@@ -72,6 +72,7 @@ def run_vllm(
     max_model_len: Optional[int],
     enforce_eager: bool,
     max_num_seqs: int = 256,
+    profile: bool = False,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -107,7 +108,11 @@ def run_vllm(
 
     start = time.perf_counter()
     # FIXME(woosuk): Do not use internal method.
+    if profile:
+        torch.cuda.cudart().cudaProfilerStart()
     llm._run_engine(use_tqdm=True)
+    if profile:
+        torch.cuda.cudart().cudaProfilerStop()
     end = time.perf_counter()
     return end - start
 
@@ -210,7 +215,7 @@ def main(args: argparse.Namespace):
                                 args.seed, args.n, args.use_beam_search,
                                 args.trust_remote_code, args.dtype,
                                 args.max_model_len, args.enforce_eager,
-                                args.max_num_seqs)
+                                args.max_num_seqs, args.profile)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -272,6 +277,8 @@ if __name__ == "__main__":
                         help='trust remote code from huggingface')
     parser.add_argument("--max-num-seqs", type=int, default=256,
                         help="Max number of sequences to process in one batch.")
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling markers.")
     parser.add_argument(
         '--max-model-len',
         type=int,

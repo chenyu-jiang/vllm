@@ -21,7 +21,7 @@ class MixtralParallelMLP(nn.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
-        hidden_act: str,
+        hidden_act: Optional[str] = "silu",
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
@@ -83,7 +83,7 @@ class MixtralMLP(nn.Module):
         current_hidden_states, _ = self.w2(current_hidden_states)
         return current_hidden_states
 
-def run_benchmark_cudagraph(batch_size, repeat: int, num_iters: int, warmup_iters: int, tp_size: int = False) -> float:
+def run_benchmark_cudagraph(batch_size, repeat: int, num_iters: int, warmup_iters: int, tp_size: int) -> float:
     if tp_size > 1:
         model = MixtralParallelMLP(hidden_size=4096, intermediate_size=14336)
     else:
@@ -112,7 +112,7 @@ def run_benchmark_cudagraph(batch_size, repeat: int, num_iters: int, warmup_iter
     avg_latency = sum(latencies) / len(latencies)
     return avg_latency
 
-def run_benchmark(batch_size, repeat: int, num_iters: int, warmup_iters: int, tp_size: int = False) -> float:
+def run_benchmark(batch_size, repeat: int, num_iters: int, warmup_iters: int, tp_size: int) -> float:
     if tp_size > 1:
         model = MixtralParallelMLP(hidden_size=4096, intermediate_size=14336)
     else:
@@ -142,13 +142,26 @@ if __name__ == "__main__":
     repeat = 20
     num_iters = 100
     warmup_iters = 20
-    tp_size = 1
-    use_cuda_graph = False
+    tp_size = 2
+    use_cuda_graph = True
     if tp_size > 1:
+        torch.distributed.init_process_group(
+            backend="nccl",
+            world_size=tp_size,
+        )
         initialize_model_parallel(tp_size)
-    with open(f"./expert_computation_tp{tp_size}{'_cudagraph' if use_cuda_graph else ''}.csv", "w") as f:
+        tp_rank = torch.distributed.get_rank()
+        torch.cuda.set_device(tp_rank)
+    else:
+        tp_rank = 0
+    if tp_rank == 0:
+        f = open(f"./expert_computation_tp{tp_size}{'_cudagraph' if use_cuda_graph else ''}.csv", "w")
         f.write("tp_size,batch_size,avg_latency\n")
-        for batch_size in [1, 2, 4, 8, 16, 32, 40, 48, 56, 64, 128, 256, 384, 512, 1024]:
-            avg_latency = run_benchmark_cudagraph(batch_size, repeat, num_iters, warmup_iters)
+    for batch_size in [1, 2, 4, 8, 16, 32, 40, 48, 56, 64, 128, 256, 384, 512, 1024]:
+        if use_cuda_graph:
+            avg_latency = run_benchmark_cudagraph(batch_size, repeat, num_iters, warmup_iters, tp_size)
+        else:
+            avg_latency = run_benchmark(batch_size, repeat, num_iters, warmup_iters, tp_size)
+        if tp_rank == 0:
             f.write(f"{tp_size},{batch_size},{avg_latency}\n")
             f.flush()

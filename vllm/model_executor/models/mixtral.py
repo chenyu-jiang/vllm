@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Mixtral model."""
+import os
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -53,6 +54,7 @@ from vllm.sequence import SamplerOutput
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
+_EXPERT_ID_DUMP_PATH = os.environ.get("VLLM_MIXTRAL_DUMP_EXPERT_ID", None)
 
 class MixtralMLP(nn.Module):
 
@@ -62,11 +64,13 @@ class MixtralMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         linear_method: Optional[LinearMethodBase] = None,
+        expert_id: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.num_experts = num_experts
         self.ffn_dim = intermediate_size
         self.hidden_dim = hidden_size
+        self.expert_id = expert_id
 
         self.w1 = ReplicatedLinear(self.hidden_dim,
                                    self.ffn_dim,
@@ -99,6 +103,7 @@ class MixtralMoE(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        layer_id: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
@@ -106,6 +111,7 @@ class MixtralMoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_total_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
+        self.layer_id = layer_id
         if self.tp_size > self.num_total_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -121,7 +127,8 @@ class MixtralMoE(nn.Module):
             MixtralMLP(self.num_total_experts,
                        config.hidden_size,
                        config.intermediate_size,
-                       linear_method=linear_method)
+                       linear_method=linear_method,
+                       expert_id=idx)
             if idx in self.expert_indicies else None
             for idx in range(self.num_total_experts)
         ])
@@ -130,7 +137,7 @@ class MixtralMoE(nn.Module):
                                      bias=False,
                                      linear_method=None)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, token_ids: List[int] = None) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
@@ -141,6 +148,17 @@ class MixtralMoE(nn.Module):
                                                        self.top_k,
                                                        dim=-1)
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        if token_ids is not None and self.rank == 0 and not torch.cuda.is_current_stream_capturing():
+            # save the expert ids
+            assert self.layer_id is not None, "layer_id is not set"
+            assert _EXPERT_ID_DUMP_PATH is not None, "dump path is not set, please set env VLLM_MIXTRAL_DUMP_EXPERT_ID"
+            if not os.path.exists(_EXPERT_ID_DUMP_PATH):
+                with open(_EXPERT_ID_DUMP_PATH, "w") as f:
+                    f.write("token_id\tlayer_id\texpert_ids\n")
+            with open(_EXPERT_ID_DUMP_PATH, "a") as f:
+                for token_id, expert_ids in zip(token_ids, selected_experts):
+                    expert_ids_list = expert_ids.tolist()
+                    f.write(f"{token_id}\t{self.layer_id}\t{','.join([str(x) for x in expert_ids_list])}\n")
 
         final_hidden_states = None
         for expert_idx in self.expert_indicies:
@@ -244,9 +262,11 @@ class MixtralDecoderLayer(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        layer_id: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_id = layer_id
         # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 10000)
         self.self_attn = MixtralAttention(
@@ -258,7 +278,8 @@ class MixtralDecoderLayer(nn.Module):
             sliding_window=config.sliding_window,
             linear_method=linear_method)
         self.block_sparse_moe = MixtralMoE(config=config,
-                                           linear_method=linear_method)
+                                           linear_method=linear_method,
+                                           layer_id=layer_id)
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
@@ -271,6 +292,7 @@ class MixtralDecoderLayer(nn.Module):
         kv_cache: KVCache,
         input_metadata: InputMetadata,
         residual: Optional[torch.Tensor],
+        token_ids: Optional[List[int]] = None,
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
@@ -289,7 +311,7 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states)
+        hidden_states = self.block_sparse_moe(hidden_states, token_ids)
         return hidden_states, residual
 
 
@@ -309,8 +331,9 @@ class MixtralModel(nn.Module):
             config.hidden_size,
         )
         self.layers = nn.ModuleList([
-            MixtralDecoderLayer(config, linear_method=linear_method)
-            for _ in range(config.num_hidden_layers)
+            MixtralDecoderLayer(config, linear_method=linear_method,
+                                layer_id=idx)
+            for idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -320,6 +343,7 @@ class MixtralModel(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
+        token_ids: Optional[List[int]] = None,
     ) -> SamplerOutput:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
@@ -327,7 +351,7 @@ class MixtralModel(nn.Module):
             layer = self.layers[i]
             hidden_states, residual = layer(positions, hidden_states,
                                             kv_caches[i], input_metadata,
-                                            residual)
+                                            residual, token_ids)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -352,9 +376,10 @@ class MixtralForCausalLM(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
+        token_ids: Optional[List[int]] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   input_metadata)
+                                   input_metadata, token_ids)
         return hidden_states
 
     def sample(

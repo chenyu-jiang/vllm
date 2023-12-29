@@ -96,7 +96,7 @@ def run_vllm(
             temperature=0.0 if use_beam_search else 1.0,
             top_p=1.0,
             use_beam_search=use_beam_search,
-            ignore_eos=True,
+            ignore_eos=False,
             max_tokens=output_len,
         )
         # FIXME(woosuk): Do not use internal method.

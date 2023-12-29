@@ -1,4 +1,5 @@
 import time
+import os
 from typing import Dict, List, Tuple, Union
 
 import numpy as np
@@ -10,7 +11,12 @@ from vllm.logger import init_logger
 from vllm.model_executor import get_model, InputMetadata, SamplingMetadata
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
-from vllm.utils import in_wsl
+from vllm.utils import in_wsl, Counter
+from vllm.model_executor.parallel_utils.parallel_state import (
+    get_tensor_model_parallel_rank
+)
+
+_TOKEN_ID_DUMP_PATH = os.environ.get("VLLM_MIXTRAL_DUMP_TOKEN_IDS", None)
 
 logger = init_logger(__name__)
 
@@ -55,6 +61,8 @@ class ModelRunner:
         self.graph_block_tables = None  # Set after initial profiling.
         # cache in_wsl result
         self.in_wsl = in_wsl()
+        # token counter
+        self.token_counter = Counter()
 
     def load_model(self) -> None:
         self.model = get_model(self.model_config)
@@ -340,8 +348,11 @@ class ModelRunner:
             inputs = self._prepare_prompt(seq_group_metadata_list)
             input_tokens, input_positions, input_metadata = inputs
         else:
+            raw_tokens_data = [(next(self.token_counter),
+                        list(sgmeta.seq_data.values())[0].get_token_ids()) for sgmeta in seq_group_metadata_list]
             inputs = self._prepare_decode(seq_group_metadata_list)
             input_tokens, input_positions, input_metadata = inputs
+            token_ids = [x[0] for x in raw_tokens_data]
 
         # Execute the model.
         if input_metadata.use_cuda_graph:
@@ -354,6 +365,7 @@ class ModelRunner:
             positions=input_positions,
             kv_caches=kv_caches,
             input_metadata=input_metadata,
+            token_ids=token_ids if not is_prompt else None,
         )
 
         sampling_metadata = self._prepare_sample(seq_group_metadata_list,
@@ -364,6 +376,15 @@ class ModelRunner:
             hidden_states=hidden_states,
             sampling_metadata=sampling_metadata,
         )
+        if not is_prompt:
+            for (token_id, input_tokens), seqgroup_output in zip(raw_tokens_data, output):
+                out_token_id = seqgroup_output.samples[0].output_token
+                if _TOKEN_ID_DUMP_PATH is not None and get_tensor_model_parallel_rank() == 0:
+                    if not os.path.exists(_TOKEN_ID_DUMP_PATH):
+                        with open(_TOKEN_ID_DUMP_PATH, "w") as f:
+                            f.write(f"token_id\tinput_tokens\tout_token_id\n")
+                    with open(_TOKEN_ID_DUMP_PATH, "a") as f:
+                        f.write(f"{token_id}\t{','.join([str(t) for t in input_tokens])}\t{out_token_id}\n")
         return output
 
     @torch.inference_mode()

@@ -22,9 +22,11 @@
 # limitations under the License.
 """Inference-only Mixtral model."""
 import os
+import io
 from typing import List, Optional, Tuple
 
 import numpy as np
+import h5py
 
 import torch
 import torch.nn.functional as F
@@ -55,6 +57,7 @@ from vllm.sequence import SamplerOutput
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 _EXPERT_ID_DUMP_PATH = os.environ.get("VLLM_MIXTRAL_DUMP_EXPERT_ID", None)
+_EXPERT_ACTIVATION_DUMP_PATH = os.environ.get("VLLM_MIXTRAL_DUMP_EXPERT_ACTIVATION", None)
 
 class MixtralMLP(nn.Module):
 
@@ -169,6 +172,26 @@ class MixtralMoE(nn.Module):
 
             current_hidden_states = expert_layer(hidden_states).mul_(
                 expert_weights)
+            if _EXPERT_ACTIVATION_DUMP_PATH is not None and token_ids and not torch.cuda.is_current_stream_capturing():
+                h5f = h5py.File(f"{_EXPERT_ACTIVATION_DUMP_PATH}_e{expert_idx}.h5", "a")
+                # write expert param to h5 if not exist
+                if "/expert_params" not in h5f:
+                    for w_name, w in expert_layer.named_parameters():
+                        expert_params = bytes()
+                        params_io = io.BytesIO(expert_params)
+                        torch.save(w.cpu(), params_io)
+                        h5f.create_dataset(f"/expert_params/{w_name}", data=np.asarray(params_io.read()))
+                for idx, token_id in enumerate(token_ids):
+                    # expert_weights
+                    expert_weights_bytes = bytes()
+                    weight_io = io.BytesIO(expert_weights_bytes)
+                    torch.save(expert_weights[idx].cpu(), weight_io)
+                    h5f.create_dataset(f"/{token_id}/l{self.layer_id}/expert_weights", data=np.asarray(weight_io.read()))
+                    # hidden_states
+                    hidden_states_bytes = bytes()
+                    hidden_io = io.BytesIO(hidden_states_bytes)
+                    torch.save(current_hidden_states[idx].cpu(), hidden_io)
+                    h5f.create_dataset(f"/{token_id}/l{self.layer_id}/hidden_states", data=np.asarray(hidden_io.read()))
             if final_hidden_states is None:
                 final_hidden_states = current_hidden_states
             else:

@@ -10,15 +10,20 @@ import torch
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Pipeline model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
+# Data parallel group that the current rank belongs to.
+_DATA_PARALLEL_GROUP = None
 
 # A list of global ranks for each pipeline group to ease calculation of the
 # source rank when broadcasting from the first or last pipeline stage.
 _PIPELINE_GLOBAL_RANKS = None
+_DATA_PARALLEL_GLOBAL_RANKS = None
+
 
 
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    data_parallel_size: int = 1,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -47,11 +52,12 @@ def initialize_model_parallel(
     world_size: int = torch.distributed.get_world_size()
 
     if (world_size !=
-            tensor_model_parallel_size * pipeline_model_parallel_size):
+            tensor_model_parallel_size * pipeline_model_parallel_size * data_parallel_size):
         raise RuntimeError(
             f"world_size ({world_size}) is not equal to "
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
-            f"pipeline_model_parallel_size ({pipeline_model_parallel_size})")
+            f"pipeline_model_parallel_size ({pipeline_model_parallel_size}) x "
+            f"data_parallel_size ({data_parallel_size})")
 
     num_tensor_model_parallel_groups: int = (world_size //
                                              tensor_model_parallel_size)
@@ -82,11 +88,29 @@ def initialize_model_parallel(
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
 
+    # Build the data parallel groups.
+    global _DATA_PARALLEL_GROUP
+    global _DATA_PARALLEL_GLOBAL_RANKS
+    for i in range(pipeline_model_parallel_size):
+        start_rank = i * num_pipeline_model_parallel_groups
+        end_rank = (i + 1) * num_pipeline_model_parallel_groups
+        for j in range(tensor_model_parallel_size):
+            ranks = range(
+                start_rank + j, end_rank, tensor_model_parallel_size
+            )
+            group = torch.distributed.new_group(
+                ranks
+            )
+            if rank in ranks:
+                _DATA_PARALLEL_GROUP = group
+                _DATA_PARALLEL_GLOBAL_RANKS = ranks
+
 
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
     return (_TENSOR_MODEL_PARALLEL_GROUP is not None
-            and _PIPELINE_MODEL_PARALLEL_GROUP is not None)
+            and _PIPELINE_MODEL_PARALLEL_GROUP is not None
+            and _DATA_PARALLEL_GROUP is not None)
 
 
 def get_tensor_model_parallel_group():
@@ -103,6 +127,13 @@ def get_pipeline_model_parallel_group():
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
+def get_data_parallel_group():
+    """Get the data parallel group the caller rank belongs to."""
+    assert _DATA_PARALLEL_GROUP is not None, (
+        "data parallel group is not initialized")
+    return _DATA_PARALLEL_GROUP
+
+
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
     return torch.distributed.get_world_size(
@@ -115,6 +146,10 @@ def get_pipeline_model_parallel_world_size():
         group=get_pipeline_model_parallel_group())
 
 
+def get_data_parallel_world_size():
+    """Return world size for the data parallel group."""
+    return torch.distributed.get_world_size(group=get_data_parallel_group())
+
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
     return torch.distributed.get_rank(group=get_tensor_model_parallel_group())
@@ -125,6 +160,10 @@ def get_pipeline_model_parallel_rank():
     return torch.distributed.get_rank(
         group=get_pipeline_model_parallel_group())
 
+
+def get_data_parallel_rank():
+    """Return my rank for the data parallel group."""
+    return torch.distributed.get_rank(group=get_data_parallel_group())
 
 def get_tensor_model_parallel_src_rank():
     """Calculate the global rank corresponding to the first local rank
@@ -177,3 +216,7 @@ def destroy_model_parallel():
     _PIPELINE_MODEL_PARALLEL_GROUP = None
     global _PIPELINE_GLOBAL_RANKS
     _PIPELINE_GLOBAL_RANKS = None
+    global _DATA_PARALLEL_GROUP
+    _DATA_PARALLEL_GROUP = None
+    global _DATA_PARALLEL_GLOBAL_RANKS
+    _DATA_PARALLEL_GLOBAL_RANKS = None

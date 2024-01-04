@@ -209,6 +209,10 @@ def _init_distributed_environment(
             "distributed_init_method must be set if torch.distributed "
             "is not already initialized")
     else:
+        if parallel_config.data_parallel_size > 1:
+            # offset the rank
+            rank = rank + (parallel_config.data_parallel_rank) * (
+                parallel_config.tensor_parallel_size)
         torch.distributed.init_process_group(
             backend="nccl",
             world_size=parallel_config.world_size,
@@ -219,7 +223,8 @@ def _init_distributed_environment(
     # A small all_reduce for warmup.
     torch.distributed.all_reduce(torch.zeros(1).cuda())
     initialize_model_parallel(parallel_config.tensor_parallel_size,
-                              parallel_config.pipeline_parallel_size)
+                              parallel_config.pipeline_parallel_size,
+                              parallel_config.data_parallel_size,)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):

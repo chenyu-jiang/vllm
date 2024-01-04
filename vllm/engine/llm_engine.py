@@ -80,6 +80,7 @@ class LLMEngine:
             f"download_dir={model_config.download_dir!r}, "
             f"load_format={model_config.load_format}, "
             f"tensor_parallel_size={parallel_config.tensor_parallel_size}, "
+            f"data_parallel_size={parallel_config.data_parallel_size}, "
             f"quantization={model_config.quantization}, "
             f"enforce_eager={model_config.enforce_eager}, "
             f"seed={model_config.seed})")
@@ -158,6 +159,8 @@ class LLMEngine:
         self.workers: List[RayWorkerVllm] = []
 
         driver_ip = get_ip()
+        data_parallel_size = self.parallel_config.data_parallel_size
+        data_parallel_rank = self.parallel_config.data_parallel_rank
         for bundle_id, bundle in enumerate(placement_group.bundle_specs):
             if not bundle.get("GPU", 0):
                 continue
@@ -191,6 +194,17 @@ class LLMEngine:
             self.driver_dummy_worker.get_node_and_gpu_ids.remote())
         worker_node_and_gpu_ids = ray.get(
             [worker.get_node_and_gpu_ids.remote() for worker in self.workers])
+        if data_parallel_size > 1:
+            # If data parallelism is used, we need to set CUDA_VISIBLE_DEVICES
+            # for the driver process to make sure the driver process uses the
+            # correct GPU.
+            tp_size = self.parallel_config.tensor_parallel_size
+            gpu_offset = tp_size * data_parallel_rank
+            driver_gpu_ids = [gpu_id + gpu_offset for gpu_id in driver_gpu_ids]
+            for i, (node_id, gpu_ids) in enumerate(worker_node_and_gpu_ids):
+                worker_node_and_gpu_ids[i] = (node_id,
+                                              [gpu_id + gpu_offset
+                                               for gpu_id in gpu_ids])
 
         node_workers = defaultdict(list)
         node_gpus = defaultdict(list)
@@ -209,7 +223,10 @@ class LLMEngine:
         for worker, (node_id, _) in zip(self.workers, worker_node_and_gpu_ids):
             worker.set_cuda_visible_devices.remote(node_gpus[node_id])
 
-        distributed_init_method = f"tcp://{driver_ip}:{get_open_port()}"
+        if data_parallel_size > 1:
+            distributed_init_method = "env://"
+        else:
+            distributed_init_method = f"tcp://{driver_ip}:{get_open_port()}"
 
         # Lazy import the Worker to avoid importing torch.cuda/xformers
         # before CUDA_VISIBLE_DEVICES is set in the Worker

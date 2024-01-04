@@ -69,3 +69,6 @@ def get_open_port() -> int:
 
 def set_cuda_visible_devices(device_ids: List[int]) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, device_ids))
+
+def get_cuda_available_devices() -> List[int]:
+    return list(range(torch.cuda.device_count()))

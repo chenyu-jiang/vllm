@@ -331,15 +331,20 @@ class ParallelConfig:
         self,
         pipeline_parallel_size: int,
         tensor_parallel_size: int,
+        data_parallel_size: int,
         worker_use_ray: bool,
         max_parallel_loading_workers: Optional[int] = None,
     ) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
+        self.data_parallel_size = data_parallel_size
+        self.data_parallel_rank = os.environ.get("LOCAL_RANK", None)
+        assert self.data_parallel_rank is not None
+        self.data_parallel_rank = int(self.data_parallel_rank)
         self.worker_use_ray = worker_use_ray
         self.max_parallel_loading_workers = max_parallel_loading_workers
 
-        self.world_size = pipeline_parallel_size * tensor_parallel_size
+        self.world_size = pipeline_parallel_size * tensor_parallel_size * data_parallel_size
         if self.world_size > 1:
             self.worker_use_ray = True
         self._verify_args()

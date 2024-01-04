@@ -1,5 +1,6 @@
 from typing import Optional
 import time
+import argparse
 
 import torch
 from torch import nn
@@ -139,11 +140,16 @@ def run_benchmark(batch_size, repeat: int, num_iters: int, warmup_iters: int, tp
     return avg_latency
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--use-cuda-graph", action="store_true")
+    args = parser.parse_args()
+
     repeat = 20
     num_iters = 100
     warmup_iters = 20
-    tp_size = 2
-    use_cuda_graph = True
+    tp_size = args.tp_size
+    use_cuda_graph = args.use_cuda_graph
     if tp_size > 1:
         torch.distributed.init_process_group(
             backend="nccl",
@@ -157,7 +163,7 @@ if __name__ == "__main__":
     if tp_rank == 0:
         f = open(f"./expert_computation_tp{tp_size}{'_cudagraph' if use_cuda_graph else ''}.csv", "w")
         f.write("tp_size,batch_size,avg_latency\n")
-    for batch_size in [1, 2, 4, 8, 16, 32, 40, 48, 56, 64, 128, 256, 384, 512, 1024]:
+    for batch_size in [1, 2, 4] + [8 * i for i in range(1, 65)] + [640, 768, 896, 1024]:
         if use_cuda_graph:
             avg_latency = run_benchmark_cudagraph(batch_size, repeat, num_iters, warmup_iters, tp_size)
         else:

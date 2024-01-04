@@ -48,5 +48,5 @@ if __name__ == "__main__":
 
     demo = build_demo()
     demo.queue().launch(server_name=args.host,
-                                             server_port=args.port,
-                                             share=True)
+                        server_port=args.port,
+                        share=True)

@@ -186,3 +186,5 @@ _build/
 benchmarks/mixtral_*
 benchmarks/plot_*
 benchmarks/**/*.pdf
+benchmarks/*_dataset/*
+**/wandb/*

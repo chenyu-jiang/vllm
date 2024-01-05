@@ -5,6 +5,8 @@ import argparse
 import torch
 from torch import nn
 
+import numpy as np
+
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     MergedColumnParallelLinear,
@@ -13,8 +15,45 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.parallel_utils.parallel_state import (
-    initialize_model_parallel
+    initialize_model_parallel, get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size
 )
+from vllm.model_executor.parallel_utils.communication_op import (
+    tensor_model_parallel_all_reduce
+)
+
+class MixtralParallelMoEWithoutGate(nn.Module):
+
+    def __init__(
+        self, n_experts: int, hidden_size: int, intermediate_size: int, unified_reduce: bool = False
+    ):
+        super().__init__()
+        self.rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.num_experts = n_experts
+        self.unified_reduce = unified_reduce
+
+        self.experts = nn.ModuleList([
+            MixtralParallelMLP(hidden_size, intermediate_size, reduce_results=not unified_reduce)
+            for _ in range(n_experts)
+        ])
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, hidden_dim = hidden_states.shape
+
+        final_hidden_states = None
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+
+            current_hidden_states = expert_layer(hidden_states)
+            if final_hidden_states is None:
+                final_hidden_states = current_hidden_states
+            else:
+                final_hidden_states.add_(current_hidden_states)
+
+        if self.unified_reduce:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        return final_hidden_states.view(batch_size, hidden_dim)
 
 class MixtralParallelMLP(nn.Module):
 
@@ -24,6 +63,7 @@ class MixtralParallelMLP(nn.Module):
         intermediate_size: int,
         hidden_act: Optional[str] = "silu",
         linear_method: Optional[LinearMethodBase] = None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -33,6 +73,7 @@ class MixtralParallelMLP(nn.Module):
         self.down_proj = RowParallelLinear(intermediate_size,
                                            hidden_size,
                                            bias=False,
+                                           reduce_results=reduce_results,
                                            linear_method=linear_method)
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
@@ -84,11 +125,8 @@ class MixtralMLP(nn.Module):
         current_hidden_states, _ = self.w2(current_hidden_states)
         return current_hidden_states
 
-def run_benchmark_cudagraph(batch_size, repeat: int, num_iters: int, warmup_iters: int, tp_size: int) -> float:
-    if tp_size > 1:
-        model = MixtralParallelMLP(hidden_size=4096, intermediate_size=14336)
-    else:
-        model = MixtralMLP(num_experts=1, hidden_size=4096, intermediate_size=14336)
+def run_benchmark_cudagraph(n_experts, batch_size, repeat: int, num_iters: int, warmup_iters: int, unified_reduce: bool) -> float:
+    model = MixtralParallelMoEWithoutGate(n_experts, hidden_size=4096, intermediate_size=14336, unified_reduce=unified_reduce)
     model = model.cuda()
     model = model.to(torch.bfloat16)
     model.eval()
@@ -113,11 +151,8 @@ def run_benchmark_cudagraph(batch_size, repeat: int, num_iters: int, warmup_iter
     avg_latency = sum(latencies) / len(latencies)
     return avg_latency
 
-def run_benchmark(batch_size, repeat: int, num_iters: int, warmup_iters: int, tp_size: int) -> float:
-    if tp_size > 1:
-        model = MixtralParallelMLP(hidden_size=4096, intermediate_size=14336)
-    else:
-        model = MixtralMLP(num_experts=1, hidden_size=4096, intermediate_size=14336)
+def run_benchmark(n_experts, batch_size, repeat: int, num_iters: int, warmup_iters: int, unified_reduce: bool) -> float:
+    model = MixtralParallelMoEWithoutGate(n_experts, hidden_size=4096, intermediate_size=14336, unified_reduce=unified_reduce)
     model = model.cuda()
     model = model.to(torch.bfloat16)
     model.eval()
@@ -162,12 +197,14 @@ if __name__ == "__main__":
         tp_rank = 0
     if tp_rank == 0:
         f = open(f"./expert_computation_tp{tp_size}{'_cudagraph' if use_cuda_graph else ''}.csv", "w")
-        f.write("tp_size,batch_size,avg_latency\n")
-    for batch_size in [1, 2, 4] + [8 * i for i in range(1, 65)] + [640, 768, 896, 1024]:
-        if use_cuda_graph:
-            avg_latency = run_benchmark_cudagraph(batch_size, repeat, num_iters, warmup_iters, tp_size)
-        else:
-            avg_latency = run_benchmark(batch_size, repeat, num_iters, warmup_iters, tp_size)
-        if tp_rank == 0:
-            f.write(f"{tp_size},{batch_size},{avg_latency}\n")
-            f.flush()
+        f.write("n_experts,tp_size,batch_size,avg_latency,unified_reduce\n")
+    for n_experts in [1, 2, 4, 8]:
+        for unified_reduce in [False, True]:
+            for batch_size in [1, 2, 4] + [8 * i for i in range(1, 65)] + [640, 768, 896, 1024]:
+                if use_cuda_graph:
+                    avg_latency = run_benchmark_cudagraph(n_experts, batch_size, repeat, num_iters, warmup_iters, unified_reduce)
+                else:
+                    avg_latency = run_benchmark(n_experts, batch_size, repeat, num_iters, warmup_iters, unified_reduce)
+                if tp_rank == 0:
+                    f.write(f"{n_experts},{tp_size},{batch_size},{avg_latency},{unified_reduce}\n")
+                    f.flush()

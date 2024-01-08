@@ -14,8 +14,6 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from transformers import AutoTokenizer
-
 from vllm.transformers_utils.config import get_config
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.weight_utils import hf_model_weights_iterator
@@ -64,7 +62,7 @@ class BOWRegressor(torch.nn.Module):
         x = self.fc(x)
         outputs = []
         for i in range(self.n_prediction_heads):
-            outputs.append(F.softmax(getattr(self, f"output_{i}")(x), dim=-1))
+            outputs.append(getattr(self, f"output_{i}")(x))
         return outputs
 
 @dataclass
@@ -151,6 +149,9 @@ def create_collate_fn(model_config):
             labels.append(stacked_labels)
         input_ = torch.stack(input_) # (batch_size, max_len)
         labels = torch.stack(labels) # (batch_size, num_hidden_layers, num_local_experts)
+        # labels = torch.zeros_like(labels)
+        # labels[:,:,0] = 1
+        # labels[:,:,1] = 1
         return input_, labels
     return collate_fn
 
@@ -178,6 +179,53 @@ def init_wandb(config: ExperimentConfig):
         config=dataclasses.asdict(config),
     )
 
+def run_eval(model, model_config, exp_config, dataset):
+    eval_loss = 0
+    total_samples = 0
+    per_layer_prediction_matched = {layer_id: 0 for layer_id in range(model_config.num_hidden_layers)}
+    per_layer_prediction_missed = {layer_id: 0 for layer_id in range(model_config.num_hidden_layers)}
+    per_layer_prediction_extra = {layer_id: 0 for layer_id in range(model_config.num_hidden_layers)}
+    with torch.no_grad():
+        eval_dataloader = torch.utils.data.DataLoader(dataset.eval_dataset, batch_size=exp_config.batch_size, shuffle=False, collate_fn=create_collate_fn(model_config))
+        for input_, labels in eval_dataloader:
+            outputs = model(input_)
+            loss = 0
+            per_output_head_inputs = [x.squeeze() for x in torch.split(labels, 1, dim=1)]
+            for layer_id, (output, label) in enumerate(zip(outputs, per_output_head_inputs)):
+                loss += F.multilabel_soft_margin_loss(output, label)
+                # sample the output logits
+                sampled_output = torch.topk(output, model_config.num_experts_per_tok, dim=-1)[1].squeeze()
+                sampled_label = torch.topk(label, model_config.num_experts_per_tok, dim=-1)[1].squeeze()
+                for output_expert_ids, label_expert_ids in zip(sampled_output, sampled_label):
+                    output_expert_ids = output_expert_ids.tolist()
+                    label_expert_ids = label_expert_ids.tolist()
+                    n_matching = len(set(output_expert_ids) & set(label_expert_ids))
+                    n_output_but_not_label = len(output_expert_ids) - n_matching
+                    n_label_but_not_output = len(label_expert_ids) - n_matching
+                    per_layer_prediction_matched[layer_id] += n_matching
+                    per_layer_prediction_missed[layer_id] += n_label_but_not_output
+                    per_layer_prediction_extra[layer_id] += n_output_but_not_label
+                    total_samples += len(output_expert_ids)
+            eval_loss += loss.item()
+    eval_loss /= len(eval_dataloader)
+    eval_per_layer_accuracy = {
+        layer_id: per_layer_prediction_matched[layer_id] / (total_samples / model_config.num_hidden_layers)
+        for layer_id in range(model_config.num_hidden_layers)
+    }
+    eval_per_layer_precision = {
+        layer_id: per_layer_prediction_matched[layer_id] / (per_layer_prediction_matched[layer_id] + per_layer_prediction_extra[layer_id])
+        for layer_id in range(model_config.num_hidden_layers)
+    }
+    eval_per_layer_recall = {
+        layer_id: per_layer_prediction_matched[layer_id] / (per_layer_prediction_matched[layer_id] + per_layer_prediction_missed[layer_id])
+        for layer_id in range(model_config.num_hidden_layers)
+    }
+    eval_per_layer_f1 = {
+        layer_id: 2 * eval_per_layer_precision[layer_id] * eval_per_layer_recall[layer_id] / (eval_per_layer_precision[layer_id] + eval_per_layer_recall[layer_id])
+        for layer_id in range(model_config.num_hidden_layers)
+    }
+    return eval_loss, eval_per_layer_accuracy, eval_per_layer_precision, eval_per_layer_recall, eval_per_layer_f1
+
 def train(args):
     config = ExperimentConfig.from_dict(args)
     init_wandb(config)
@@ -193,6 +241,12 @@ def train(args):
     else:
         raise NotImplementedError(f"Unknown lr scheduler: {config.lr_scheduler}")
     model = model.cuda()
+
+    # uncomment to load checkpoint
+    # if os.path.exists(args.checkpoint_dir):
+    #     checkpoint_path = max([os.path.join(args.checkpoint_dir, f) for f in os.listdir(args.checkpoint_dir)], key=os.path.getctime)
+    #     print(f"Loading checkpoint from {checkpoint_path}")
+    #     model.load_state_dict(torch.load(checkpoint_path))
 
     data_loader = torch.utils.data.DataLoader(dataset.train_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=create_collate_fn(model_config))
     for epoch in trange(config.epochs, desc="Epoch"):
@@ -212,58 +266,19 @@ def train(args):
                 wandb.log({"train_loss": avg_loss, "step": epoch * len(data_loader) + i, "epoch": epoch})
                 avg_loss = 0
             if i != 0 and i % args.eval_interval == 0:
-                eval_loss = 0
-                total_samples = 0
-                per_layer_prediction_matched = {layer_id: 0 for layer_id in range(model_config.num_hidden_layers)}
-                per_layer_prediction_missed = {layer_id: 0 for layer_id in range(model_config.num_hidden_layers)}
-                per_layer_prediction_extra = {layer_id: 0 for layer_id in range(model_config.num_hidden_layers)}
-                with torch.no_grad():
-                    eval_dataloader = torch.utils.data.DataLoader(dataset.eval_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=create_collate_fn(model_config))
-                    for input_, labels in eval_dataloader:
-                        outputs = model(input_)
-                        loss = 0
-                        per_output_head_inputs = [x.squeeze() for x in torch.split(labels, 1, dim=1)]
-                        for layer_id, (output, label) in enumerate(zip(outputs, per_output_head_inputs)):
-                            loss += F.multilabel_soft_margin_loss(output, label)
-                            # sample the output logits
-                            sampled_output = torch.topk(output, model_config.num_local_experts, dim=-1)[1].squeeze()
-                            sampled_label = torch.topk(label, model_config.num_local_experts, dim=-1)[1].squeeze()
-                            for output_expert_ids, label_expert_ids in zip(sampled_output, sampled_label):
-                                output_expert_ids = output_expert_ids.tolist()
-                                label_expert_ids = label_expert_ids.tolist()
-                                n_matching = len(set(output_expert_ids) & set(label_expert_ids))
-                                n_output_but_not_label = len(set(output_expert_ids) - set(label_expert_ids))
-                                n_label_but_not_output = len(set(label_expert_ids) - set(output_expert_ids))
-                                per_layer_prediction_matched[layer_id] += n_matching
-                                per_layer_prediction_missed[layer_id] += n_label_but_not_output
-                                per_layer_prediction_extra[layer_id] += n_output_but_not_label
-                                total_samples += len(output_expert_ids)
-                        eval_loss += loss.item()
-                eval_loss /= len(data_loader)
-                eval_per_layer_accuracy = {
-                    layer_id: per_layer_prediction_matched[layer_id] / total_samples
-                    for layer_id in range(model_config.num_hidden_layers)
-                }
-                eval_per_layer_precision = {
-                    layer_id: per_layer_prediction_matched[layer_id] / (per_layer_prediction_matched[layer_id] + per_layer_prediction_extra[layer_id])
-                    for layer_id in range(model_config.num_hidden_layers)
-                }
-                eval_per_layer_recall = {
-                    layer_id: per_layer_prediction_matched[layer_id] / (per_layer_prediction_matched[layer_id] + per_layer_prediction_missed[layer_id])
-                    for layer_id in range(model_config.num_hidden_layers)
-                }
-                eval_per_layer_f1 = {
-                    layer_id: 2 * eval_per_layer_precision[layer_id] * eval_per_layer_recall[layer_id] / (eval_per_layer_precision[layer_id] + eval_per_layer_recall[layer_id])
-                    for layer_id in range(model_config.num_hidden_layers)
-                }
+                eval_loss, eval_per_layer_accuracy, eval_per_layer_precision, \
+                    eval_per_layer_recall, eval_per_layer_f1 = \
+                        run_eval(model, model_config, config, dataset)
                 wandb.log({"eval_loss": eval_loss, "step": epoch * len(data_loader) + i, "epoch": epoch,
-                           **{f"eval_accuracy_l{layer_id}": eval_per_layer_accuracy[layer_id] for layer_id in range(model_config.num_hidden_layers)},
-                           **{f"eval_precision_l{layer_id}": eval_per_layer_precision[layer_id] for layer_id in range(model_config.num_hidden_layers)},
-                           **{f"eval_recall_l{layer_id}": eval_per_layer_recall[layer_id] for layer_id in range(model_config.num_hidden_layers)},
-                           **{f"eval_f1_l{layer_id}": eval_per_layer_f1[layer_id] for layer_id in range(model_config.num_hidden_layers)},
-                           })
+                    **{f"eval_accuracy_l{layer_id}": eval_per_layer_accuracy[layer_id] for layer_id in range(model_config.num_hidden_layers)},
+                    **{f"eval_precision_l{layer_id}": eval_per_layer_precision[layer_id] for layer_id in range(model_config.num_hidden_layers)},
+                    **{f"eval_recall_l{layer_id}": eval_per_layer_recall[layer_id] for layer_id in range(model_config.num_hidden_layers)},
+                    **{f"eval_f1_l{layer_id}": eval_per_layer_f1[layer_id] for layer_id in range(model_config.num_hidden_layers)},
+                    })
         lr_scheduler.step()
         wandb.log({"lr": lr_scheduler.get_last_lr()[0], "epoch": epoch})
+        if not os.path.exists(args.checkpoint_dir):
+            os.makedirs(args.checkpoint_dir)
         torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, f"model_{epoch}.pt"))
 
 def parse_args():
@@ -275,8 +290,8 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--architecture", type=str, default="BOWRegressor")
     parser.add_argument("--lr-scheduler", type=str, default="CosineAnnealingLR")
-    parser.add_argument("--log-interval", type=int, default=100)
-    parser.add_argument("--eval-interval", type=int, default=1000)
+    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
     return parser.parse_args()
 

@@ -31,6 +31,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import MixtralConfig
 
+from vllm._C import moe_ops
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.attention import PagedAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -50,6 +51,7 @@ from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tensor_model_parallel_group,
+    get_tensor_model_parallel_src_rank,
     get_data_parallel_rank,
     get_data_parallel_world_size,
     get_data_parallel_group,
@@ -120,11 +122,11 @@ class MixtralTensorParallelMLP(nn.Module):
         self.ffn_dim = intermediate_size
         self.hidden_dim = hidden_size
 
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.w1_w3 = MergedColumnParallelLinear(
             hidden_size, [intermediate_size] * 2,
             bias=False,
             linear_method=linear_method)
-        self.down_proj = RowParallelLinear(intermediate_size,
+        self.w2 = RowParallelLinear(intermediate_size,
                                            hidden_size,
                                            bias=False,
                                            reduce_results=False,
@@ -132,9 +134,9 @@ class MixtralTensorParallelMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(hidden_states)
+        gate_up, _ = self.w1_w3(hidden_states)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.w2(x)
         return x
 
 
@@ -145,7 +147,7 @@ class MixtralMoE(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
-        parallel_method: str = MixtralParallelism.DATA_EXPERT_PARALLEL
+        parallel_method: str = MixtralParallelism.TENSOR_EXPERT_PARALLEL
     ):
         super().__init__()
         self.config = config
@@ -227,110 +229,92 @@ class MixtralMoE(nn.Module):
             return tensor_model_parallel_all_reduce(final_hidden_states).view(
                 batch_size, sequence_length, hidden_dim)
         else:
-            reordered_hidden_states = []
-            n_tokens_per_expert = []
-            expert_masks = []
-            reduced_expert_masks = []
-            for dp_rank in self.dp_size:
-                for expert_idx in self.all_rank_expert_indicies[dp_rank]:
-                    expert_mask = selected_experts == expert_idx
-                    reduced_expert_mask = expert_mask.any(dim=-1)
-                    sliced_hidden_states = hidden_states[reduced_expert_mask]
-                    n_tokens_per_expert.append(sliced_hidden_states.shape[0])
-                    reordered_hidden_states.append(sliced_hidden_states)
-                    expert_masks.append(expert_mask)
-                    reduced_expert_masks.append(reduced_expert_mask)
-            reordered_hidden_states = torch.cat(reordered_hidden_states, dim=0)
-            n_send_tokens_per_expert_cuda = torch.tensor(n_tokens_per_expert,
-                                                    device=hidden_states.device,
-                                                    dtype=torch.long)
-            n_recv_tokens_per_expert_cuda = torch.empty_like(
-                    n_send_tokens_per_expert_cuda)
+            # dispatch
+            n_tokens = hidden_states.shape[0]
+            token_locations = torch.zeros((n_tokens, self.top_k),
+                                           dtype=torch.long,
+                                           device=hidden_states.device)
+            moe_ops.moe_gen_location(token_locations, selected_experts,
+                                     self.top_k, n_tokens,
+                                     self.num_total_experts)
+            dispatched_hidden_states = torch.zeros(
+                (self.num_total_experts, n_tokens * self.top_k, hidden_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device)
+            moe_ops.moe_dispatch(dispatched_hidden_states, selected_experts,
+                                    token_locations, hidden_states, self.top_k,
+                                    n_tokens, hidden_dim, self.num_total_experts)
+            # [DxLE = E, C, M]
+            local_hidden_states = torch.empty((self.num_total_experts, n_tokens * self.top_k, hidden_dim),
+                                    dtype=hidden_states.dtype,
+                                    device=hidden_states.device)
             if self.tp_rank == 0:
-                # 1. exchange token size
-                torch.distributed.all_to_all_single(n_recv_tokens_per_expert_cuda,
-                                                    n_send_tokens_per_expert_cuda,
-                                                    group=get_data_parallel_group())
-                # 2. exchange hidden_states
-                total_local_tokens = n_recv_tokens_per_expert_cuda.sum().item()
-                local_hidden_states = torch.empty((total_local_tokens, hidden_dim),
-                                                    dtype=hidden_states.dtype,
-                                                    device=hidden_states.device)
+                # 1. exchange hidden_states
                 torch.distributed.all_to_all_single(local_hidden_states,
-                                                    reordered_hidden_states,
-                                                    n_recv_tokens_per_expert_cuda.tolist(),
-                                                    n_send_tokens_per_expert_cuda.tolist(),
+                                                    dispatched_hidden_states,
                                                     group=get_data_parallel_group())
-                # 3. broadcast hidden_states across tensor parallel ranks
-                torch.distributed.broadcast(n_recv_tokens_per_expert_cuda,
-                                            src=0,
-                                            group=get_tensor_model_parallel_group())
+                # 2. broadcast hidden_states across tensor parallel ranks
                 torch.distributed.broadcast(local_hidden_states,
-                                            src=0,
+                                            src=get_tensor_model_parallel_src_rank(),
                                             group=get_tensor_model_parallel_group())
             else:
-                # receive token size
-                torch.distributed.broadcast(n_recv_tokens_per_expert_cuda,
-                                            src=0,
-                                            group=get_tensor_model_parallel_group())
-                # create empty tensor to receive hidden_states
-                total_local_tokens = n_recv_tokens_per_expert_cuda.sum().item()
-                local_hidden_states = torch.empty((total_local_tokens, hidden_dim),
-                                                    dtype=hidden_states.dtype,
-                                                    device=hidden_states.device)
                 # receive hidden_states
                 torch.distributed.broadcast(local_hidden_states,
-                                            src=0,
+                                            src=get_tensor_model_parallel_src_rank(),
                                             group=get_tensor_model_parallel_group())
-            # split hidden_states across experts
-            local_hidden_states = local_hidden_states.reshape(self.dp_size, -1, hidden_dim)
-            assert local_hidden_states.shape[1] == len(self.expert_indicies), (
-                f"Expected {len(self.expert_indicies)} experts, got {local_hidden_states.shape[1]}")
-            per_local_expert_hidden_states = [x.squeeze() for x in torch.split(local_hidden_states, 1, dim=1)]
+            # [DxLE, C, M] -> [D, LE, C, M]
+            per_expert_hidden_states = [
+                t.squeeze() for t in 
+                torch.split(
+                    local_hidden_states.reshape(
+                        -1,
+                        len(self.expert_indicies),
+                        n_tokens * self.top_k,
+                        hidden_dim
+                    ),
+                    1,
+                    dim=1
+                )
+            ]
+            expert_outputs = []
             for local_expert_idx, expert_idx in enumerate(self.expert_indicies):
                 expert_layer = self.experts[expert_idx]
-                per_local_expert_hidden_states[local_expert_idx] = (
-                    torch.unsqueeze(
-                    expert_layer(
-                        per_local_expert_hidden_states[local_expert_idx]
-                        ),
-                    dim=1)
-                )
-            # gather expert outputs
-            local_hidden_states = torch.cat(per_local_expert_hidden_states, dim=1).reshape(-1, hidden_dim)
+                expert_out = expert_layer(per_expert_hidden_states[local_expert_idx])
+                expert_outputs.append(expert_out)
+            # List[D, C, M] -> [D, LE, C, M] -> [DxLE, C, M]
+            local_hidden_states = torch.cat([t.unsqueeze(1) for t in expert_outputs], dim=1)
+            local_hidden_states = local_hidden_states.reshape(-1, n_tokens * self.top_k, hidden_dim)
             # reduce to tp rank 0
-            local_hidden_states = torch.distributed.reduce(local_hidden_states,
-                                                           dst=0,
-                                                           group=get_tensor_model_parallel_group())
+            torch.distributed.reduce(local_hidden_states,
+                                     dst=get_tensor_model_parallel_src_rank(),
+                                     group=get_tensor_model_parallel_group())
             if self.tp_rank == 0:
-                # exchange hidden_states across data parallel ranks
-                torch.distributed.all_to_all_single(reordered_hidden_states,
+                # exchange local_hidden_states across data parallel ranks
+                torch.distributed.all_to_all_single(dispatched_hidden_states,
                                                     local_hidden_states,
-                                                    n_send_tokens_per_expert_cuda.tolist(),
-                                                    n_recv_tokens_per_expert_cuda.tolist(),
                                                     group=get_data_parallel_group())
                 # broadcast hidden_states across tensor parallel ranks
-                torch.distributed.broadcast(reordered_hidden_states,
-                                            src=0,
+                torch.distributed.broadcast(dispatched_hidden_states,
+                                            src=get_tensor_model_parallel_src_rank(),
                                             group=get_tensor_model_parallel_group())
             else:
                 # receive hidden_states
-                torch.distributed.broadcast(reordered_hidden_states,
-                                            src=0,
+                torch.distributed.broadcast(dispatched_hidden_states,
+                                            src=get_tensor_model_parallel_src_rank(),
                                             group=get_tensor_model_parallel_group())
-            # reorder back
-            cum_locations = torch.cumsum(torch.tensor(n_tokens_per_expert), dim=0).tolist()
-            cum_locations.insert(0, 0)
-            hidden_states = torch.zeros_like(hidden_states)
-            for dp_rank in self.dp_size:
-                for expert_idx in self.all_rank_expert_indicies[dp_rank]:
-                    expert_mask = expert_masks[expert_idx]
-                    reduced_expert_mask = reduced_expert_masks[expert_idx]
-                    hidden_states[expert_mask] += (
-                        reordered_hidden_states[cum_locations[expert_idx]:cum_locations[expert_idx+1]] *
-                        (routing_weights * expert_mask).sum(dim=-1)
-                    )
-            return hidden_states.view(batch_size, sequence_length, hidden_dim)
+            # gather
+            gathered_hidden_states = torch.zeros((n_tokens, hidden_dim),
+                                                  dtype=hidden_states.dtype,
+                                                  device=hidden_states.device)
+            moe_ops.moe_gather(gathered_hidden_states,
+                                dispatched_hidden_states,
+                                routing_weights.to(hidden_states.dtype),
+                                selected_experts,
+                                token_locations,
+                                self.top_k,
+                                n_tokens,
+                                hidden_dim)
+            return gathered_hidden_states.view(batch_size, sequence_length, hidden_dim)
 
 
 class MixtralAttention(nn.Module):
@@ -417,6 +401,7 @@ class MixtralDecoderLayer(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        parallel_method: str = MixtralParallelism.TENSOR_EXPERT_PARALLEL,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -431,7 +416,8 @@ class MixtralDecoderLayer(nn.Module):
             sliding_window=config.sliding_window,
             linear_method=linear_method)
         self.block_sparse_moe = MixtralMoE(config=config,
-                                           linear_method=linear_method)
+                                           linear_method=linear_method,
+                                           parallel_method=parallel_method)
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
@@ -472,6 +458,7 @@ class MixtralModel(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        parallel_method: str = MixtralParallelism.TENSOR_EXPERT_PARALLEL,
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -482,7 +469,8 @@ class MixtralModel(nn.Module):
             config.hidden_size,
         )
         self.layers = nn.ModuleList([
-            MixtralDecoderLayer(config, linear_method=linear_method)
+            MixtralDecoderLayer(config, linear_method=linear_method,
+                                parallel_method=parallel_method)
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -511,11 +499,14 @@ class MixtralForCausalLM(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        parallel_method: str = MixtralParallelism.TENSOR_EXPERT_PARALLEL,
     ) -> None:
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.model = MixtralModel(config, linear_method)
+        self.parallel_method = parallel_method
+        self.model = MixtralModel(config, linear_method,
+                                  parallel_method=parallel_method)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.sampler = Sampler(config.vocab_size)
 
@@ -550,6 +541,11 @@ class MixtralForCausalLM(nn.Module):
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
+        if self.parallel_method == MixtralParallelism.DATA_EXPERT_PARALLEL:
+            stacked_params_mapping.extend([
+                ("w1_w3", "w1", 0),
+                ("w1_w3", "w3", 1),
+            ])
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in hf_model_weights_iterator(
@@ -566,6 +562,10 @@ class MixtralForCausalLM(nn.Module):
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip experts that are not assigned to this worker.
+                if ("block_sparse_moe.experts." in name
+                        and name not in params_dict):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader

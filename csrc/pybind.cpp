@@ -75,6 +75,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     &gather_cached_kv,
     "Gather key and value from the cache into contiguous QKV tensors");
 
+  // MoE ops
+  pybind11::module moe_ops = m.def_submodule("moe_ops", "vLLM MoE ops");
+  moe_ops.def(
+    "moe_dispatch",
+    &moe_dispatch,
+    "Dispatch the input tensor to the MoE experts");
+  moe_ops.def(
+    "moe_gather",
+    &moe_gather,
+    "Gather the output from the MoE experts"
+  );
+  moe_ops.def(
+    "moe_gen_location",
+    &moe_gen_location,
+    "Generate location tensor from expert indices"
+  );
+
   // Cuda utils
   pybind11::module cuda_utils = m.def_submodule("cuda_utils", "vLLM cuda utils");
   cuda_utils.def(

@@ -89,3 +89,27 @@ torch::Tensor gptq_gemm(
 void gptq_shuffle(
   torch::Tensor q_weight,
   torch::Tensor q_perm);
+
+void moe_dispatch(torch::Tensor& dispatched_input,
+                    torch::Tensor& expert_indices,
+                    torch::Tensor& locations,
+                    torch::Tensor& input_hidden_states,
+                    const int k,
+                    const int tokens,
+                    const int hidden,
+                    const int num_experts);
+
+void moe_gather(torch::Tensor& decoded_output,
+                torch::Tensor& expert_output,
+                torch::Tensor& routing_weights,
+                torch::Tensor& expert_indices,
+                torch::Tensor& locations,
+                const int k,
+                const int tokens,
+                const int hidden);
+
+void moe_gen_location(torch::Tensor& output_locations,
+                      torch::Tensor& expert_indices,
+                      const int k,
+                      const int tokens,
+                      const int num_experts);

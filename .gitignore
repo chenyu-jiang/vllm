@@ -188,3 +188,4 @@ benchmarks/plot_*
 benchmarks/**/*.pdf
 benchmarks/*_dataset/*
 **/wandb/*
+**/*.pt

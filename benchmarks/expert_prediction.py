@@ -251,6 +251,7 @@ def train(args):
     data_loader = torch.utils.data.DataLoader(dataset.train_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=create_collate_fn(model_config))
     for epoch in trange(config.epochs, desc="Epoch"):
         avg_loss = 0
+        loss_count = 0
         for i, (input_, labels) in tqdm(enumerate(data_loader), desc="Step", total=len(data_loader)):
             optimizer.zero_grad()
             outputs = model(input_)
@@ -261,10 +262,12 @@ def train(args):
             loss.backward()
             optimizer.step()
             avg_loss += loss.item()
+            loss_count += 1
             if i != 0 and i % args.log_interval == 0:
-                avg_loss /= args.log_interval
+                avg_loss /= loss_count
                 wandb.log({"train_loss": avg_loss, "step": epoch * len(data_loader) + i, "epoch": epoch})
                 avg_loss = 0
+                loss_count = 0
             if i != 0 and i % args.eval_interval == 0:
                 eval_loss, eval_per_layer_accuracy, eval_per_layer_precision, \
                     eval_per_layer_recall, eval_per_layer_f1 = \
@@ -286,13 +289,13 @@ def parse_args():
     parser.add_argument("--data-dir", type=str, required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--architecture", type=str, default="BOWRegressor")
     parser.add_argument("--lr-scheduler", type=str, default="CosineAnnealingLR")
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--eval-interval", type=int, default=500)
-    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints")
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints_b256")
     return parser.parse_args()
 
 if __name__ == "__main__":

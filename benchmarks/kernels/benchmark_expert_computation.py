@@ -198,9 +198,11 @@ if __name__ == "__main__":
     if tp_rank == 0:
         f = open(f"./expert_computation_tp{tp_size}{'_cudagraph' if use_cuda_graph else ''}.csv", "w")
         f.write("n_experts,tp_size,batch_size,avg_latency,unified_reduce\n")
-    for n_experts in [1, 2, 4, 8]:
-        for unified_reduce in [False, True]:
-            for batch_size in [1, 2, 4] + [8 * i for i in range(1, 65)] + [640, 768, 896, 1024]:
+    # for n_experts in [1, 2, 4, 8]:
+    for n_experts in [1]:
+        # for unified_reduce in [False, True]:
+        for unified_reduce in [True]:
+            for batch_size in [1, 2, 4] + [8 * i for i in range(1, 65)] + [640 + 128 * i for i in range(28)]:
                 if use_cuda_graph:
                     avg_latency = run_benchmark_cudagraph(n_experts, batch_size, repeat, num_iters, warmup_iters, unified_reduce)
                 else:

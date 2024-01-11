@@ -86,9 +86,6 @@ def run_benchmark(batch_size, parallel_method: MixtralParallelism) -> float:
     print("Dummy input shape: {}".format(dummy_input.shape))
     output = model(dummy_input)
     torch.cuda.synchronize()
-    # if rank == 0:
-    #     import code
-    #     code.interact(local=locals())
     return output
 
 if __name__ == "__main__":

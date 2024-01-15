@@ -187,5 +187,6 @@ benchmarks/mixtral_*
 benchmarks/plot_*
 benchmarks/**/*.pdf
 benchmarks/*_dataset/*
+benchmarks/**/*.txt
 **/wandb/*
 **/*.pt

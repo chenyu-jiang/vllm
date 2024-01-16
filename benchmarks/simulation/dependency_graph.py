@@ -226,7 +226,7 @@ class RequestGraph:
         return graph
 
 
-def build_graph_from_dataset(dataset_dir) -> Tuple[List[RequestGraph], int]:
+def build_graph_from_dataset(dataset_dir: str, max_samples: int) -> Tuple[List[RequestGraph], int]:
     # TODO: hard code file names for now
     # parse test_dump_expert_ids.tsv
     n_layers = 0
@@ -293,8 +293,7 @@ def build_graph_from_dataset(dataset_dir) -> Tuple[List[RequestGraph], int]:
         with open(os.path.join(dataset_dir, "dataset.pkl"), "rb") as f:
             unique_sequences, token_id_to_output_token, token_id_to_experts, n_layers = pickle.load(f)
 
-    # DEBUG
-    # unique_sequences = unique_sequences[:100]
+    unique_sequences = unique_sequences[:max_samples]
 
     request_graphs = []
     for req_id, (token_ids, _, orig_context) in tqdm.tqdm(enumerate(unique_sequences),

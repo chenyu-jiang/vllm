@@ -118,13 +118,17 @@ def parse_args():
     parser.add_argument("-d", "--dataset-dir", type=str, required=True)
     parser.add_argument("-c", "--cost-model-dir", type=str, required=True)
     parser.add_argument("-s", "--strategy", type=str, required=True)
+    parser.add_argument("-n", "--n-samples", type=int, default=1000)
     parser.add_argument("--max-batch-size", type=int, default=4096)
     parser.add_argument("--per-token-latency-slo-ms", type=float, default=1000.0)
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     return args
 
 def main(args):
-    graphs, n_layers = build_graph_from_dataset(args.dataset_dir)
+    if args.debug:
+        logger.setLevel("DEBUG")
+    graphs, n_layers = build_graph_from_dataset(args.dataset_dir, max_samples=args.n_samples)
     print("Loaded {} graphs.".format(len(graphs)))
 
     cm_save_path = os.path.join(args.cost_model_dir, "cost_model.pkl")

@@ -33,8 +33,8 @@ class PrioritizeThroughput(ScheduleStrategy):
                 ready_nodes_by_phase[phase] = []
             ready_nodes_by_phase[phase].append(node)
         # select the phase with the most available nodes
-        (selected_layer, _, selected_expert_id), current_batch_nodes = max(ready_nodes_by_phase, key=lambda x: len(x[1]))
-        if self._current_phase == ExpertNode:
+        (selected_layer, selected_node_type, selected_expert_id), current_batch_nodes = max(ready_nodes_by_phase.items(), key=lambda x: len(x[1]))
+        if selected_node_type == ExpertNode:
             # schedule one expert at a time
             logger.debug("Scheduling {} expert nodes: Layer {}, Expert {}".format(
                 len(current_batch_nodes), selected_layer, selected_expert_id)

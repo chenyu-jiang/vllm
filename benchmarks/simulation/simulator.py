@@ -119,6 +119,8 @@ def parse_args():
     parser.add_argument("-c", "--cost-model-dir", type=str, required=True)
     parser.add_argument("-s", "--strategy", type=str, required=True)
     parser.add_argument("-n", "--n-samples", type=int, default=1000)
+    parser.add_argument("--truncate-tokens", type=int, default=None)
+    parser.add_argument("--truncate-layers", type=int, default=None)
     parser.add_argument("--max-batch-size", type=int, default=4096)
     parser.add_argument("--per-token-latency-slo-ms", type=float, default=1000.0)
     parser.add_argument("--debug", action="store_true")
@@ -128,7 +130,10 @@ def parse_args():
 def main(args):
     if args.debug:
         logger.setLevel("DEBUG")
-    graphs, n_layers = build_graph_from_dataset(args.dataset_dir, max_samples=args.n_samples)
+    graphs, n_layers, n_experts = build_graph_from_dataset(args.dataset_dir,
+                                                           max_samples=args.n_samples,
+                                                           max_decoded_tokens=args.truncate_tokens,
+                                                           max_layers=args.truncate_layers)
     print("Loaded {} graphs.".format(len(graphs)))
 
     cm_save_path = os.path.join(args.cost_model_dir, "cost_model.pkl")
@@ -137,14 +142,33 @@ def main(args):
     else:
         cost_model = ProfileBasedCostModel(args.cost_model_dir)
         cost_model.save(cm_save_path)
+    scheduler_kwargs = {}
+    if args.strategy == "ILP":
+        scheduler_kwargs["request_graphs"] = graphs
+        scheduler_kwargs["n_experts_per_token"] = n_experts
+        scheduler_kwargs["max_T"] = 48
+    elif args.strategy == "PT" or args.strategy == "PTL":
+        scheduler_kwargs["n_experts_per_token"] = n_experts
+        scheduler_kwargs["graphs"] = graphs
     strategy = get_schedule_strategy(args.strategy,
                                      n_layers=n_layers,
-                                     per_token_latency_slo_ms=args.per_token_latency_slo_ms)
+                                     per_token_latency_slo_ms=args.per_token_latency_slo_ms,
+                                     **scheduler_kwargs)
     simulator = Simulator(graphs, cost_model, strategy, args.per_token_latency_slo_ms, args.max_batch_size)
     simulator.simulate()
     stats = simulator.get_latency_stats()
+    # check that all requests are completed
+    for graph in graphs:
+        req_id = graph.req_id
+        stat = stats[req_id]
+        assert len(stat._per_token_finish_time) == len(graph.decoded_token_ids), \
+            "Request {} has {} tokens, but only {} tokens are completed.".format(
+                req_id, len(graph.decoded_token_ids), len(stat._per_token_finish_time)
+            )
     print("Finished {} requests.".format(len(stats)))
     flattened_token_latencies = [latency for stat in stats.values() for latency in stat.get_per_token_latencies()[1:]]
+    if hasattr(strategy, "_activated_experts_history"):
+        print("Avg activated experts per batch: {}".format(sum(strategy._activated_experts_history) / len(strategy._activated_experts_history)))
     print("Avg latency: {} ms.".format(sum(flattened_token_latencies) / len(flattened_token_latencies)))
     print("Avg throughput: {} tokens/s.".format(simulator.get_throughput()))
 

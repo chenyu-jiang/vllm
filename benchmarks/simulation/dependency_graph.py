@@ -226,7 +226,11 @@ class RequestGraph:
         return graph
 
 
-def build_graph_from_dataset(dataset_dir: str, max_samples: int) -> Tuple[List[RequestGraph], int]:
+def build_graph_from_dataset(dataset_dir: str,
+                             max_samples: int,
+                             max_decoded_tokens: int = None,
+                             max_layers: int = None,
+                            ) -> Tuple[List[RequestGraph], int]:
     # TODO: hard code file names for now
     # parse test_dump_expert_ids.tsv
     n_layers = 0
@@ -294,6 +298,8 @@ def build_graph_from_dataset(dataset_dir: str, max_samples: int) -> Tuple[List[R
             unique_sequences, token_id_to_output_token, token_id_to_experts, n_layers = pickle.load(f)
 
     unique_sequences = unique_sequences[:max_samples]
+    if max_layers:
+        n_layers = min(n_layers, max_layers)
 
     request_graphs = []
     for req_id, (token_ids, _, orig_context) in tqdm.tqdm(enumerate(unique_sequences),
@@ -301,6 +307,8 @@ def build_graph_from_dataset(dataset_dir: str, max_samples: int) -> Tuple[List[R
                                                           desc="Building request graphs"):
         decoded_token_ids = [token_id_to_output_token[token_id]
                              for token_id in token_ids]
+        if max_decoded_tokens:
+            decoded_token_ids = decoded_token_ids[:max_decoded_tokens]
         graph = RequestGraph(req_id, orig_context, decoded_token_ids)
         node_id_counter = 0
         def _get_next_node_id():
@@ -331,7 +339,9 @@ def build_graph_from_dataset(dataset_dir: str, max_samples: int) -> Tuple[List[R
                                              token_index=token_index)
                     expert_nodes.append(expert_node)
                 graph_nodes.append(expert_nodes)
+            if max_decoded_tokens and token_index == max_decoded_tokens - 1:
+                break
         graph_nodes.append([FinNode(node_id=_get_next_node_id(), req_id=req_id, layer_id=n_layers)])
         graph.init_from_list(graph_nodes)
         request_graphs.append(graph)
-    return request_graphs, n_layers
+    return request_graphs, n_layers, len(list(token_id_to_experts.values())[0][0])

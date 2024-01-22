@@ -17,6 +17,8 @@ class FCFS(ScheduleStrategy):
         self._prev_batch_requests: List[Tuple(int, int)] = []
         self._current_layer: int = 0
         self._current_phase: type[GraphNode] = AttnNode
+        self._activated_experts_per_batch = 0
+        self._activated_experts_history = []
 
     def _advance_phase(self) -> None:
         if self._current_phase == AttnNode:
@@ -34,6 +36,8 @@ class FCFS(ScheduleStrategy):
         self._current_batch_requests = []
         self._current_layer = 0
         self._current_phase = AttnNode
+        self._activated_experts_history.append(self._activated_experts_per_batch)
+        self._activated_experts_per_batch = 0
 
     def schedule(self,
                  stats_dict: Dict[int, RequestStats],
@@ -94,6 +98,7 @@ class FCFS(ScheduleStrategy):
                 self._current_layer,
                 current_batch_ready_nodes[0].expert_id
             ))
+            self._activated_experts_per_batch += 1
             return ModelComponent.EXPERT, current_batch_ready_nodes
         else:
             # schedule all attn nodes together

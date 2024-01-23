@@ -25,6 +25,68 @@ def create_is_gt0_integer_var(model: gp.Model, x: gp.Var, big_M: float = 1000):
     model.addConstr(x <= big_M * z)
     return z
 
+def find_best_tokens_local_search(expert_selection_per_node: List[Tuple[int, int]],
+                                  max_batch_size: int) -> List[int]:
+    effective_max_batch_size = min(max_batch_size, len(expert_selection_per_node))
+    selected_indices = set(range(effective_max_batch_size))
+    while True:
+        best_score = calculate_activated_experts(expert_selection_per_node, selected_indices)
+        un_selected_indices = set(range(len(expert_selection_per_node))) - selected_indices
+        # try to swap out each index
+        found_better = False
+        for i in selected_indices:
+            for j in un_selected_indices:
+                new_selected_indices = selected_indices.copy()
+                new_selected_indices.remove(i)
+                new_selected_indices.add(j)
+                new_score = calculate_activated_experts(expert_selection_per_node, new_selected_indices)
+                if new_score < best_score:
+                    selected_indices = new_selected_indices
+                    best_score = new_score
+                    found_better = True
+                    break
+            if found_better:
+                break
+        if not found_better:
+            break
+    return best_score
+
+def find_best_tokens_greedy(expert_selection_per_node: List[Tuple[int, int]],
+                                  max_batch_size: int) -> List[int]:
+    effective_max_batch_size = min(max_batch_size, len(expert_selection_per_node))
+    selected_indices = set()
+    un_selected_indices = set(range(len(expert_selection_per_node)))
+    selected_experts = set()
+    def _update_selected_experts(new_indices):
+        tmp_experts = set()
+        for i in new_indices:
+            for exp in expert_selection_per_node[i]:
+                tmp_experts.add(exp)
+        return selected_experts | tmp_experts
+    while len(selected_indices) < effective_max_batch_size:
+        min_score = float("inf")
+        best_selected_indices = selected_indices.copy()
+        best_selected_experts = selected_experts.copy()
+        best_index = None
+        for i in un_selected_indices:
+            new_experts = _update_selected_experts([i])
+            if len(new_experts) < min_score:
+                best_selected_indices = selected_indices | {i}
+                best_selected_experts = new_experts
+                best_index = i
+                min_score = len(new_experts)
+        un_selected_indices.remove(best_index)
+        selected_indices = best_selected_indices
+        selected_experts = best_selected_experts
+    return calculate_activated_experts(expert_selection_per_node, selected_indices)
+
+
+def find_best_tokens_random(expert_selection_per_node: List[Tuple[int, int]],
+                            max_batch_size: int) -> List[int]:
+    effective_max_batch_size = min(max_batch_size, len(expert_selection_per_node))
+    random_indices = random.sample(range(len(expert_selection_per_node)), effective_max_batch_size)
+    return calculate_activated_experts(expert_selection_per_node, random_indices)
+
 def find_best_tokens(expert_selection_per_node: List[Tuple[int, int]],
                    max_batch_size: int
                    ) -> int:
@@ -121,13 +183,24 @@ def calculate_distribution(n_samples: int,
                            k_candidate_experts: int,
                            n_experts: int,
                            max_batch_size: int,
+                           solver: str = "gurobi",
                            n_trials: int = 1000):
     counts = defaultdict(int)
     for _ in tqdm.trange(n_trials):
         expert_selection_per_node = generate_random_expert_indices(n_samples, k_candidate_experts, n_experts)
-        activated_experts = find_best_tokens_and_experts(expert_selection_per_node,
-                                                         k_experts_per_token=k_experts_each,
-                                                         max_batch_size=max_batch_size)
+        if solver == "gurobi":
+            activated_experts = find_best_tokens_and_experts(expert_selection_per_node,
+                                                            k_experts_per_token=k_experts_each,
+                                                            max_batch_size=max_batch_size)
+        elif solver == "localsearch":
+            activated_experts = find_best_tokens_local_search(expert_selection_per_node,
+                                                              max_batch_size=max_batch_size)
+        elif solver == "greedy":
+            activated_experts = find_best_tokens_greedy(expert_selection_per_node,
+                                                        max_batch_size=max_batch_size)
+        elif solver == "random":
+            activated_experts = find_best_tokens_random(expert_selection_per_node,
+                                                        max_batch_size=max_batch_size)
         counts[activated_experts] += 1
     return {k: v / n_trials for k, v in counts.items()}
 
@@ -137,6 +210,7 @@ def main():
     parser.add_argument("--n_experts", type=int, default=8)
     parser.add_argument("--k_experts_each", type=int, default=2)
     parser.add_argument("--k_candidate_experts", type=int, default=2)
+    parser.add_argument("--solver", type=str, choices=["gurobi", "localsearch", "random", "greedy"], default="gurobi")
     parser.add_argument("--max_batch_size", required=True, type=int)
     args = parser.parse_args()
     n_samples = args.n_samples
@@ -144,9 +218,10 @@ def main():
     k_experts_each = args.k_experts_each
     k_candidate_experts = args.k_candidate_experts
     max_batch_size = args.max_batch_size
-    distribution = calculate_distribution(n_samples, k_experts_each, k_candidate_experts, n_experts, max_batch_size)
+    distribution = calculate_distribution(n_samples, k_experts_each, k_candidate_experts, n_experts, max_batch_size, args.solver)
     path = (f"distribution_ne{n_experts}_k{k_experts_each}"
            f"{'_relaxtop' + str(args.k_candidate_experts) if not args.k_candidate_experts == args.k_experts_each else ''}"
+           f"{'_solver_' + args.solver if not args.solver == 'gurobi' else ''}"
             ".csv")
     if not os.path.exists(path):
         with open(path, "w") as f:

@@ -122,6 +122,8 @@ def parse_args():
     parser.add_argument("--truncate-tokens", type=int, default=None)
     parser.add_argument("--truncate-layers", type=int, default=None)
     parser.add_argument("--max-batch-size", type=int, default=4096)
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--min-candidates-per-expert", type=int, default=128)
     parser.add_argument("--per-token-latency-slo-ms", type=float, default=1000.0)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
@@ -133,7 +135,8 @@ def main(args):
     graphs, n_layers, n_experts = build_graph_from_dataset(args.dataset_dir,
                                                            max_samples=args.n_samples,
                                                            max_decoded_tokens=args.truncate_tokens,
-                                                           max_layers=args.truncate_layers)
+                                                           max_layers=args.truncate_layers,
+                                                           repeat=args.repeat)
     print("Loaded {} graphs.".format(len(graphs)))
 
     cm_save_path = os.path.join(args.cost_model_dir, "cost_model.pkl")
@@ -147,9 +150,11 @@ def main(args):
         scheduler_kwargs["request_graphs"] = graphs
         scheduler_kwargs["n_experts_per_token"] = n_experts
         scheduler_kwargs["max_T"] = 48
-    elif args.strategy == "PT" or args.strategy == "PTL":
+    elif args.strategy.startswith("PT"):
         scheduler_kwargs["n_experts_per_token"] = n_experts
         scheduler_kwargs["graphs"] = graphs
+        if args.strategy == "PTLW":
+            scheduler_kwargs["min_candidates_per_expert"] = args.min_candidates_per_expert
     strategy = get_schedule_strategy(args.strategy,
                                      n_layers=n_layers,
                                      per_token_latency_slo_ms=args.per_token_latency_slo_ms,

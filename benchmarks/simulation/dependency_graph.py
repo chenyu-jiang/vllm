@@ -230,6 +230,7 @@ def build_graph_from_dataset(dataset_dir: str,
                              max_samples: int,
                              max_decoded_tokens: int = None,
                              max_layers: int = None,
+                             repeat: int = 1,
                             ) -> Tuple[List[RequestGraph], int]:
     # TODO: hard code file names for now
     # parse test_dump_expert_ids.tsv
@@ -300,6 +301,9 @@ def build_graph_from_dataset(dataset_dir: str,
     unique_sequences = unique_sequences[:max_samples]
     if max_layers:
         n_layers = min(n_layers, max_layers)
+
+    # repeat unique sequences
+    unique_sequences = unique_sequences * repeat
 
     request_graphs = []
     for req_id, (token_ids, _, orig_context) in tqdm.tqdm(enumerate(unique_sequences),

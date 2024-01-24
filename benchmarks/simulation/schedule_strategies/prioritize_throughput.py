@@ -209,8 +209,7 @@ class PrioritizeThroughput(ScheduleStrategy):
                 current_token_nodes.append(self.graphs[req_id].nodes[node_id:node_id + n_nodes_per_token])
             # find the best tokens
             t = time.time()
-            best_token_indices, activated_experts = find_best_tokens(current_token_nodes, max_batch_size)
-            # best_token_indices, activated_experts = find_best_tokens_local_search({0: current_token_nodes}, max_batch_size)[0]
+            best_token_indices, activated_experts = find_best_tokens_greedy({0: current_token_nodes}, max_batch_size)[0]
             self._activated_experts_history.append(activated_experts)
             # logger.info("Finding best tokens took {} seconds".format(time.time() - t))
             best_req_ids = sorted(set([current_token_nodes[i][0].req_id for i in best_token_indices]))
@@ -280,7 +279,6 @@ class PrioritizeThroughputLayerwise(ScheduleStrategy):
                 current_token_nodes.append(self.graphs[req_id].nodes[node_id:node_id + n_nodes_per_layer])
             # find the best tokens
             t = time.time()
-            # best_token_indices = find_best_tokens(current_token_nodes, max_batch_size)
             current_token_nodes_by_layer = {}
             for i, nodes in enumerate(current_token_nodes):
                 layer_id = 0
@@ -291,7 +289,7 @@ class PrioritizeThroughputLayerwise(ScheduleStrategy):
                 if layer_id not in current_token_nodes_by_layer:
                     current_token_nodes_by_layer[layer_id] = []
                 current_token_nodes_by_layer[layer_id].append(nodes)
-            grouping_results = find_best_tokens_local_search(current_token_nodes_by_layer, max_batch_size)
+            grouping_results = find_best_tokens_greedy(current_token_nodes_by_layer, max_batch_size)
             selected_layer = None
             best_expert_over_bs = float('inf')
             for layer_id, (best_token_indices, activated_experts) in grouping_results.items():
@@ -376,7 +374,6 @@ class PrioritizeThroughputLayerwiseWithWait(ScheduleStrategy):
                 current_token_nodes.append(self.graphs[req_id].nodes[node_id:node_id + n_nodes_per_layer])
             # find the best tokens
             t = time.time()
-            # best_token_indices = find_best_tokens(current_token_nodes, max_batch_size)
             current_token_nodes_by_layer = {}
             for i, nodes in enumerate(current_token_nodes):
                 layer_id = 0

@@ -27,11 +27,10 @@ for fn in fns:
         continue
     schedule = os.path.basename(fn).split("_")[0]
     bs = int(os.path.basename(fn).split("_")[1][2:])
-    if "mce" in fn:
+    if schedule != "FCFS":
         act_experts = act_experts * 4
+    if "mce" in fn:
         mce = int(os.path.basename(fn).split("_")[2][3:])
-        # if mce != 128:
-        #     continue
     else:
         mce = None
     data_list.append((schedule, bs, mce, act_experts, lat, throughput))

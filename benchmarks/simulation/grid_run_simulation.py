@@ -3,8 +3,7 @@ import io
 import subprocess
 
 BATCH_SIZES = [1, 4, 8, 16, 32, 64, 128, 256, 512]
-MCES = [128]
-MCES_BS_32 = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+MCES = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 CMD = "cd ~/vllm && python3 -m benchmarks.simulation.simulator -d /root/vllm/benchmarks/simulation/expert_dataset -c /root/vllm/benchmarks/simulation/cost_model "
 
 all_args = []
@@ -14,7 +13,7 @@ for strategy in ["FCFS", "PTLW", "PT", "PTL"]:
         fname = "{}_bs{}".format(strategy, bs)
         args = ["-s", strategy, "--max-batch-size", str(bs), "--truncate-layers", "4"]
         if strategy == "PTLW":
-            for mce in (MCES if bs != 32 else MCES_BS_32):
+            for mce in MCES:
                 mce_args = args + ["--min-candidates-per-expert", str(mce)]
                 mce_fname = fname + "_mce{}".format(mce)
                 all_args.append(mce_args)
@@ -51,6 +50,16 @@ def _check_outputs():
 if not os.path.exists("./simulation_results"):
     os.makedirs("./simulation_results")
 for args, fn in zip(all_args, all_fns):
+    # check if we already have results for this
+    if os.path.exists("./simulation_results/{}_stdout.txt".format(fn)):
+        skip = False
+        with open("./simulation_results/{}_stdout.txt".format(fn), "r") as f:
+            for line in f:
+                if "Avg throughput:" in line:
+                    skip = True
+                    break
+        if skip:
+            continue
     while len(ps) >= 8:
         _check_outputs()
     p = subprocess.Popen(CMD + " ".join(args),
@@ -58,3 +67,6 @@ for args, fn in zip(all_args, all_fns):
     ps.append(p)
     readers.append(io.TextIOWrapper(p.stdout, encoding='utf8'))
     fs.append(open("./simulation_results/{}_stdout.txt".format(fn), "w"))
+
+while len(ps) > 0:
+    _check_outputs()

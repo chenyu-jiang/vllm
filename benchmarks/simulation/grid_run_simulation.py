@@ -28,24 +28,33 @@ readers = []
 fs = []
 def _check_outputs():
     global ps, readers, fs
-    if any([p.poll() is None for p in ps]):
-        for p, rd, f in zip(ps, readers, fs):
-            if p.poll() is None:
-                # stream output to file
-                char = rd.read(1)
-                if char:
-                    f.write(char)
-                    f.flush()
-            else:
-                # check remaining output and close
-                for char in iter(lambda: rd.read(1), ''):
-                    f.write(char)
-                    f.flush()
-                rd.close()
-                f.close()
-            ps = [p for p in ps if p.poll() is None]
-            readers = [rd for rd in readers if not rd.closed]
-            fs = [f for f in fs if not f.closed]
+    for p, rd, f in zip(ps, readers, fs):
+        if p.poll() is None:
+            # stream output to file
+            char = rd.read(1)
+            if char:
+                f.write(char)
+                f.flush()
+        else:
+            # check remaining output and close
+            for char in iter(lambda: rd.read(1), ''):
+                f.write(char)
+                f.flush()
+            rd.close()
+            f.close()
+        ps = [p for p in ps if p.poll() is None]
+        readers = [rd for rd in readers if not rd.closed]
+        fs = [f for f in fs if not f.closed]
+        _print_current_running_fns()
+
+_last_printed = ""
+def _print_current_running_fns():
+    global fs
+    global _last_printed
+    s = "\rRunning: {}".format(", ".join([os.path.basename(f.name) for f in fs]))
+    if s != _last_printed:
+        _last_printed = s
+        print(s, end="", flush=True)
 
 if not os.path.exists("./simulation_results"):
     os.makedirs("./simulation_results")

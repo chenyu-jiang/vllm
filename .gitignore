@@ -186,3 +186,6 @@ _build/
 benchmarks/mixtral_*
 benchmarks/plot_*
 benchmarks/*.tsv
+benchmarks/**/*_dataset
+benchmarks/**/*_cost_model
+benchmarks/**/*_results*

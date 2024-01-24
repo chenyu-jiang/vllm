@@ -58,6 +58,7 @@ KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 _EXPERT_ID_DUMP_PATH = os.environ.get("VLLM_MIXTRAL_DUMP_EXPERT_ID", None)
 _EXPERT_ACTIVATION_DUMP_PATH = os.environ.get("VLLM_MIXTRAL_DUMP_EXPERT_ACTIVATION", None)
+_EXPERT_ROUTING_WEIGHT_DUMP_PATH = os.environ.get("VLLM_MIXTRAL_DUMP_EXPERT_ROUTING_WEIGHT", None)
 
 class MixtralMLP(nn.Module):
 
@@ -147,14 +148,24 @@ class MixtralMoE(nn.Module):
         router_logits, _ = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        if self.rank == 0 and _EXPERT_ROUTING_WEIGHT_DUMP_PATH is not None and token_ids is not None and not torch.cuda.is_current_stream_capturing():
+            # save the routing weights
+            if not os.path.exists(_EXPERT_ROUTING_WEIGHT_DUMP_PATH):
+                with open(_EXPERT_ROUTING_WEIGHT_DUMP_PATH, "w") as f:
+                    f.write("token_id\tlayer_id\texpert_weights\n")
+            with open(_EXPERT_ROUTING_WEIGHT_DUMP_PATH, "a") as f:
+                for token_id, expert_weights in zip(token_ids, routing_weights):
+                    expert_weights_list = expert_weights.tolist()
+                    f.write(f"{token_id}\t{self.layer_id}\t{','.join([str(x) for x in expert_weights_list])}\n")
+
         routing_weights, selected_experts = torch.topk(routing_weights,
                                                        self.top_k,
                                                        dim=-1)
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        if token_ids is not None and self.rank == 0 and not torch.cuda.is_current_stream_capturing():
+
+        if _EXPERT_ID_DUMP_PATH is not None and token_ids is not None and self.rank == 0 and not torch.cuda.is_current_stream_capturing():
             # save the expert ids
             assert self.layer_id is not None, "layer_id is not set"
-            assert _EXPERT_ID_DUMP_PATH is not None, "dump path is not set, please set env VLLM_MIXTRAL_DUMP_EXPERT_ID"
             if not os.path.exists(_EXPERT_ID_DUMP_PATH):
                 with open(_EXPERT_ID_DUMP_PATH, "w") as f:
                     f.write("token_id\tlayer_id\texpert_ids\n")

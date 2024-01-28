@@ -1,5 +1,6 @@
 import os
 import io
+import time
 import subprocess
 
 BATCH_SIZES = [1, 4, 8, 16, 32, 64, 128, 256, 512]
@@ -42,18 +43,20 @@ def _check_outputs():
                 f.flush()
             rd.close()
             f.close()
-        ps = [p for p in ps if p.poll() is None]
-        readers = [rd for rd in readers if not rd.closed]
-        fs = [f for f in fs if not f.closed]
-        _print_current_running_fns()
+    ps = [p for p in ps if p.poll() is None]
+    readers = [rd for rd in readers if not rd.closed]
+    fs = [f for f in fs if not f.closed]
+    _print_current_running_fns()
+    time.sleep(0.1)
 
 _last_printed = ""
 def _print_current_running_fns():
     global fs
     global _last_printed
-    s = "\rRunning: {}".format(", ".join([os.path.basename(f.name) for f in fs]))
+    s = "Running: {}".format(", ".join([os.path.basename(f.name) for f in fs]))
     if s != _last_printed:
         _last_printed = s
+        os.system("clear")
         print(s, end="", flush=True)
 
 if not os.path.exists("./simulation_results"):

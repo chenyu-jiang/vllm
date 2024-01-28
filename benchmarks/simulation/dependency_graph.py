@@ -168,9 +168,6 @@ class RequestGraph:
                                       for node in dep_layer],
                                       key=lambda node: node.node_id)
         for node in node_list_flattened:
-            if not node.node_id == len(self.nodes):
-                import code
-                code.interact(local=locals())
             assert node.node_id == len(self.nodes)
             self.nodes.append(node)
         self._init_frontier()

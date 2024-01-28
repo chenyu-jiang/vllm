@@ -32,32 +32,55 @@ for fn in fns:
     if "mce" in fn:
         mce = int(os.path.basename(fn).split("_")[2][3:])
     else:
-        mce = None
+        mce = "N/A"
     data_list.append((schedule, bs, mce, act_experts, lat, throughput))
 
-df = pd.DataFrame(data_list, columns=["schedule", "batch_size", "mce", "act_experts", "latency", "throughput"])
+# process data_list to calculate throughput speedup
+preprocessed_data_list = []
+throughput_fcfs = {}
+for schedule, bs, mce, act_experts, lat, throughput in data_list:
+    if schedule == "FCFS":
+        throughput_fcfs[bs] = throughput
+for schedule, bs, mce, act_experts, lat, throughput in data_list:
+    if schedule == "FCFS":
+        speedup = 1.0
+    else:
+        speedup = throughput / throughput_fcfs[bs]
+    preprocessed_data_list.append((schedule, bs, mce, act_experts, lat, throughput, speedup))
 
-fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-sns.lineplot(data=df, x="batch_size", y="latency", hue="schedule", ax=axes[0])
-sns.lineplot(data=df, x="batch_size", y="throughput", hue="schedule", ax=axes[1])
-sns.lineplot(data=df, x="batch_size", y="act_experts", hue="schedule", ax=axes[2])
+df = pd.DataFrame(preprocessed_data_list, columns=["schedule", "batch_size", "mce", "act_experts", "latency", "throughput", "throughput_speedup"])
+
+df = df[(df["schedule"] == "PTL") | (df["schedule"] == "FCFS")]
+df["batch_size"] = pd.Categorical(df["batch_size"].astype(str), categories=[str(x) for x in sorted(df["batch_size"].unique())], ordered=True)
+
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+sns.lineplot(data=df, x="batch_size", y="latency", hue="schedule", style="mce", ax=axes[0])
+sns.lineplot(data=df, x="batch_size", y="throughput", hue="schedule", style="mce", ax=axes[1])
+sns.lineplot(data=df, x="batch_size", y="throughput_speedup", hue="schedule", style="mce", ax=axes[2])
+sns.lineplot(data=df, x="batch_size", y="act_experts", hue="schedule", style="mce", ax=axes[3])
 axes[0].set_ylabel("Latency (ms)")
 axes[1].set_ylabel("Throughput (tokens/s)")
-axes[2].set_ylabel("Activated Experts")
-axes[0].set_xlabel("Batch Size")
-axes[1].set_xlabel("Batch Size")
-axes[2].set_xlabel("Batch Size")
+axes[2].set_ylabel("Throughput Speedup")
+axes[3].set_ylabel("Activated Experts")
+
+for ax in axes:
+    ax.set_xlabel("Batch Size")
+
+# remove style legend
+for ax in axes:
+    h, l = ax.get_legend_handles_labels()
+    ax.legend(h[0:5], l[0:5], loc='best')
 
 fig.tight_layout()
-fig.savefig("simulation_results.pdf")
+fig.savefig("simulation_results_ptl_only.pdf")
 
-mce_df = df[(df["batch_size"] == 32) & (df["schedule"] == "PTLW")]
+mce_df = df[df["schedule"] == "PTLW"]
 mce_df = mce_df.copy()
 mce_df["mce"] = pd.Categorical(mce_df["mce"].astype(int).astype(str), categories=[str(int(x)) for x in sorted(mce_df["mce"].unique())], ordered=True)
 fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-sns.lineplot(data=mce_df, x="mce", y="latency", ax=axes[0])
-sns.lineplot(data=mce_df, x="mce", y="throughput", ax=axes[1])
-sns.lineplot(data=mce_df, x="mce", y="act_experts", ax=axes[2])
+sns.lineplot(data=mce_df, x="mce", y="latency", hue="batch_size", ax=axes[0])
+sns.lineplot(data=mce_df, x="mce", y="throughput", hue="batch_size", ax=axes[1])
+sns.lineplot(data=mce_df, x="mce", y="act_experts", hue="batch_size", ax=axes[2])
 axes[0].set_ylabel("Latency (ms)")
 axes[1].set_ylabel("Throughput (tokens/s)")
 axes[2].set_ylabel("Activated Experts")

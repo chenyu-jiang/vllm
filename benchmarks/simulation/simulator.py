@@ -36,6 +36,9 @@ class Simulator:
         self.per_token_latency_slo_ms: float = per_token_latency_slo_ms
         self.max_batch_size: int = max_batch_size
         self._latency_stats: Dict[int, RequestStats] = {}
+        self._peak_kv_tokens: int = 0
+        self._avg_cost_per_step: float = 0.0
+        self._n_steps: int = 0
 
     def get_ready_nodes(self,
                         filter: Optional[Callable[[GraphNode], bool]] = None
@@ -44,6 +47,14 @@ class Simulator:
         for graph in self.request_graphs:
             ready_nodes.extend(graph.get_frontier(filter))
         return ready_nodes
+
+    def _update_peak_kv_tokens(self, ready_nodes: List[GraphNode]):
+        all_ready_requests = set([node.req_id for node in ready_nodes if node.layer_id != 0])
+        all_in_memory_tokens = 0
+        for req_id in all_ready_requests:
+            all_in_memory_tokens += len(self.request_graphs[req_id].prompt_token_ids) + \
+                                    len(self._latency_stats[req_id]._per_token_finish_time)
+        self._peak_kv_tokens = max(self._peak_kv_tokens, all_in_memory_tokens)
 
     def simulate(self):
         # follow some strategy to
@@ -59,9 +70,11 @@ class Simulator:
                                                              enqueue_time=current_time)
         with tqdm.tqdm(total=len(self.request_graphs), desc="Running simulation") as pbar:
             while True:
+                ready_nodes = self.get_ready_nodes()
+                self._update_peak_kv_tokens(ready_nodes)
                 component, nodes_to_schedule = self.scheduler.schedule(
                     self._latency_stats,
-                    self.get_ready_nodes(),
+                    ready_nodes,
                     max_batch_size=self.max_batch_size
                 )
                 if not nodes_to_schedule:
@@ -83,6 +96,8 @@ class Simulator:
                 )
                 logger.debug("Cost: {} ms".format(cost))
                 current_time += cost
+                self._avg_cost_per_step += cost
+                self._n_steps += 1
                 for node in nodes_to_schedule:
                     graph = self.request_graphs[node.req_id]
                     graph.execute(node)
@@ -125,6 +140,7 @@ def parse_args():
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--min-candidates-per-expert", type=int, default=128)
     parser.add_argument("--per-token-latency-slo-ms", type=float, default=1000.0)
+    parser.add_argument("--per-token-kv-size", type=int, default=4096/8*2)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     return args
@@ -176,6 +192,8 @@ def main(args):
         print("Avg activated experts per batch: {}".format(sum(strategy._activated_experts_history) / len(strategy._activated_experts_history)))
     print("Avg latency: {} ms.".format(sum(flattened_token_latencies) / len(flattened_token_latencies)))
     print("Avg throughput: {} tokens/s.".format(simulator.get_throughput()))
+    print("Avg cost per step: {} ms.".format(simulator._avg_cost_per_step / simulator._n_steps))
+    print("Peak KV tokens: {} MB".format(simulator._peak_kv_tokens * args.per_token_kv_size * n_layers / 1e6))
 
 if __name__ == "__main__":
     main(parse_args())

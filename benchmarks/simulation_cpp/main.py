@@ -20,6 +20,7 @@ def load_dataset(dataset_dir: str,
     # parse test_dump_expert_ids.tsv
     n_layers = 0
     n_experts = 0
+    k_experts_per_token = None
     # token_id -> layer_id -> expert_ids
     token_id_to_experts = defaultdict(lambda: defaultdict(int))
 
@@ -109,6 +110,12 @@ def load_dataset(dataset_dir: str,
             per_layer_experts = []
             for layer_id in range(n_layers):
                 expert_ids = token_id_to_experts[token_id][layer_id]
+                if k_experts_per_token is None:
+                    k_experts_per_token = len(expert_ids)
+                else:
+                    assert k_experts_per_token == len(expert_ids), \
+                        "Found different number of experts per token: " \
+                        "{} vs {}".format(k_experts_per_token, len(expert_ids))
                 per_layer_experts.append(list(expert_ids))
             per_token_experts.append(per_layer_experts)
             if max_decoded_tokens and token_index == max_decoded_tokens - 1:
@@ -116,7 +123,7 @@ def load_dataset(dataset_dir: str,
         expert_selection_list.append(per_token_experts)
         context_list.append(orig_context)
         output_list.append(decoded_token_ids)
-    return expert_selection_list, context_list, output_list, n_layers, n_experts
+    return expert_selection_list, context_list, output_list, n_layers, n_experts, k_experts_per_token
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -136,7 +143,7 @@ def parse_args():
     return args
 
 def main(args):
-    expert_selection_list, context_list, output_list, n_layers, n_experts = load_dataset(args.dataset_dir,
+    expert_selection_list, context_list, output_list, n_layers, n_experts, k_experts_per_token = load_dataset(args.dataset_dir,
                                                                                          args.n_samples,
                                                                                          args.truncate_tokens,
                                                                                          args.truncate_layers,
@@ -152,7 +159,9 @@ def main(args):
 
     t = time.time()
     stats, throughput, avg_cost_per_step, peak_kv_tokens, avg_act_experts = \
-        simulator.run_simulation(cost_model, expert_selection_list, context_list, output_list, n_layers, n_experts,
+        simulator.run_simulation(cost_model, expert_selection_list,
+                                 context_list, output_list,
+                                 n_layers, n_experts, k_experts_per_token,
                                  args.max_batch_size, args.per_token_latency_slo, args.strategy)
     elapsed = time.time() - t
     print("")

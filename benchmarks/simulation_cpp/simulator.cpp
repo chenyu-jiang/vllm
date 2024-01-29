@@ -7,7 +7,7 @@
 #include "dependency_graph.hpp"
 #include "schedule_strategies/strategy_factory.hpp"
 
-#define BENCHMARK
+// #define BENCHMARK
 
 #ifdef BENCHMARK
 #define DEF_BENCH_NAMED(name)                       \
@@ -67,7 +67,8 @@ SimulationResult RunSimulation(
     const std::vector<PerTokenExpertIds>& expert_selections,
     const std::vector<TokenIds>& context_token_ids,
     const std::vector<TokenIds>& decoded_token_ids, int n_layers,
-    int n_experts, int max_batch_size, float per_token_latency_slo,
+    int n_experts, int k_experts_per_token,
+    int max_batch_size, float per_token_latency_slo,
     std::string schedule_strategy) {
   // first check if the schedule strategy is valid
   if (!StrategyFactory::Has(schedule_strategy)) {
@@ -84,6 +85,7 @@ SimulationResult RunSimulation(
   config.Set("n_layers", n_layers);
   config.Set("n_experts", n_experts);
   config.Set("per_token_latency_slo", per_token_latency_slo);
+  config.Set("k_experts_per_token", k_experts_per_token);
   auto strategy =
       StrategyFactory::Make(schedule_strategy, request_graphs, config);
   // prepare variables for simulation
@@ -192,10 +194,16 @@ SimulationResult RunSimulation(
 PYBIND11_MODULE(simulator, m) {
   m.doc() = "C++ implementation of the simulation algorithm";
   m.def("run_simulation", &RunSimulation, "Run simulation",
-        py::arg("cost_model"), py::arg("expert_selections"),
-        py::arg("context_token_ids"), py::arg("decoded_token_ids"),
-        py::arg("n_layers"), py::arg("n_experts"), py::arg("max_batch_size"),
-        py::arg("per_token_latency_slo"), py::arg("schedule_strategy"));
+        py::arg("cost_model"),
+        py::arg("expert_selections"),
+        py::arg("context_token_ids"),
+        py::arg("decoded_token_ids"),
+        py::arg("n_layers"),
+        py::arg("n_experts"),
+        py::arg("k_experts_per_token"),
+        py::arg("max_batch_size"),
+        py::arg("per_token_latency_slo"),
+        py::arg("schedule_strategy"));
 
   py::class_<RequestStats>(m, "RequestStats")
       .def(py::init<int, float>())

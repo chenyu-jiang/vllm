@@ -158,7 +158,7 @@ class RequestGraph {
   void InitFromNodes(std::vector<GraphNodes>& from_nodes);
   const GraphNodes& GetFrontier() const;
   void Execute(GraphNodePtr node);
-  GraphNodes GetNodes();
+  const GraphNodes& GetNodes() const;
 
  protected:
   void InitFrontier_();

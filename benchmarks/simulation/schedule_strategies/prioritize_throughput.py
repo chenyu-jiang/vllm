@@ -90,6 +90,7 @@ def find_best_tokens_greedy(current_token_nodes_dict: Dict[int, List[List[GraphN
         selected_indices = set()
         un_selected_indices = set(range(len(current_token_nodes)))
         selected_experts = set()
+        logger.debug("Layer {} has {} requests.".format(layer_id, len(current_token_nodes)))
         def _update_selected_experts(new_indices):
             tmp_experts = set()
             for i in new_indices:
@@ -112,6 +113,7 @@ def find_best_tokens_greedy(current_token_nodes_dict: Dict[int, List[List[GraphN
             un_selected_indices.remove(best_index)
             selected_indices = best_selected_indices
             selected_experts = best_selected_experts
+        logger.debug("Choosing {} from {} tokens, activated {} experts.".format(len(selected_indices), len(current_token_nodes), len(selected_experts)))
         results[layer_id] = (list(selected_indices), len(selected_experts))
     return results
 
@@ -166,12 +168,12 @@ class PrioritizeThroughput(ScheduleStrategy):
     def __init__(self,
                  n_layers: int,
                  per_token_latency_slo_ms: float,
-                 n_experts_per_token: int,
+                 k_experts_per_token: int,
                  graphs: List[RequestGraph],
                  ) -> None:
         self.n_layers: int = n_layers
         self.graphs: List[RequestGraph] = graphs
-        self.n_experts_per_token: int = n_experts_per_token
+        self.k_experts_per_token: int = k_experts_per_token
         self.per_token_latency_slo_ms: float = per_token_latency_slo_ms
         self._current_req_ids: List[int] = []
         self._current_phase: Optional[Tuple[int, type[GraphNode]]] = (0, AttnNode)
@@ -204,7 +206,7 @@ class PrioritizeThroughput(ScheduleStrategy):
                 assert node.layer_id == 0
                 request_init_node_ids.append((node.req_id, node.node_id))
             request_init_node_ids = sorted(request_init_node_ids, key=lambda x: x[0])
-            n_nodes_per_token = self.n_layers * (self.n_experts_per_token + 1)
+            n_nodes_per_token = self.n_layers * (self.k_experts_per_token + 1)
             for req_id, node_id in request_init_node_ids:
                 current_token_nodes.append(self.graphs[req_id].nodes[node_id:node_id + n_nodes_per_token])
             # find the best tokens
@@ -238,12 +240,12 @@ class PrioritizeThroughputLayerwise(ScheduleStrategy):
     def __init__(self,
                  n_layers: int,
                  per_token_latency_slo_ms: float,
-                 n_experts_per_token: int,
+                 k_experts_per_token: int,
                  graphs: List[RequestGraph],
                  ) -> None:
         self.n_layers: int = n_layers
         self.graphs: List[RequestGraph] = graphs
-        self.n_experts_per_token: int = n_experts_per_token
+        self.k_experts_per_token: int = k_experts_per_token
         self.per_token_latency_slo_ms: float = per_token_latency_slo_ms
         self._current_req_ids: List[int] = []
         self._current_layer_id: int = 0
@@ -274,7 +276,7 @@ class PrioritizeThroughputLayerwise(ScheduleStrategy):
                 assert isinstance(node, AttnNode)
                 request_init_node_ids.append((node.req_id, node.node_id))
             request_init_node_ids = sorted(request_init_node_ids, key=lambda x: x[0])
-            n_nodes_per_layer = self.n_experts_per_token + 1
+            n_nodes_per_layer = self.k_experts_per_token + 1
             for req_id, node_id in request_init_node_ids:
                 current_token_nodes.append(self.graphs[req_id].nodes[node_id:node_id + n_nodes_per_layer])
             # find the best tokens
@@ -296,7 +298,12 @@ class PrioritizeThroughputLayerwise(ScheduleStrategy):
                 # how do we choose layers?
                 # choose min activated experts / batch size
                 expert_over_bs = activated_experts / len(best_token_indices)
+                logger.debug("Layer {}, BS: {}, activated experts: {}, expert_over_bs: {}".format(
+                    layer_id, len(best_token_indices), activated_experts, expert_over_bs))
                 if selected_layer is None or expert_over_bs < best_expert_over_bs:
+                    logger.debug("Found better layer: {}, updated best_expert_over_bs: {}->{}".format(
+                        layer_id, best_expert_over_bs, expert_over_bs))
+                    best_expert_over_bs = expert_over_bs
                     selected_best_token_indices = best_token_indices
                     selected_activated_experts = activated_experts
                     selected_layer = layer_id
@@ -331,13 +338,13 @@ class PrioritizeThroughputLayerwiseWithWait(ScheduleStrategy):
     def __init__(self,
                  n_layers: int,
                  per_token_latency_slo_ms: float,
-                 n_experts_per_token: int,
+                 k_experts_per_token: int,
                  graphs: List[RequestGraph],
                  min_candidates_per_expert: int = 1,
                  ) -> None:
         self.n_layers: int = n_layers
         self.graphs: List[RequestGraph] = graphs
-        self.n_experts_per_token: int = n_experts_per_token
+        self.k_experts_per_token: int = k_experts_per_token
         self.per_token_latency_slo_ms: float = per_token_latency_slo_ms
         self.min_candidates_per_expert: int = min_candidates_per_expert
         self._current_req_ids: List[int] = []
@@ -369,7 +376,7 @@ class PrioritizeThroughputLayerwiseWithWait(ScheduleStrategy):
                 assert isinstance(node, AttnNode)
                 request_init_node_ids.append((node.req_id, node.node_id))
             request_init_node_ids = sorted(request_init_node_ids, key=lambda x: x[0])
-            n_nodes_per_layer = self.n_experts_per_token + 1
+            n_nodes_per_layer = self.k_experts_per_token + 1
             for req_id, node_id in request_init_node_ids:
                 current_token_nodes.append(self.graphs[req_id].nodes[node_id:node_id + n_nodes_per_layer])
             # find the best tokens

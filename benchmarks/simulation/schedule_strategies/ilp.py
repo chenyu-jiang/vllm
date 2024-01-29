@@ -25,7 +25,7 @@ def add_disjunctive_constraints(model: gp.Model, exprs: List[gp.LinExpr], big_M:
 
 
 def solve_using_ilp_model(request_graphs: List[RequestGraph],
-                   n_experts_per_token: int,
+                   k_experts_per_token: int,
                    attn_cost: float,
                    expert_cost: float,
                    max_batch_size: int = None,
@@ -118,11 +118,11 @@ class ILP(ScheduleStrategy):
                  n_layers: int,
                  per_token_latency_slo_ms: float,
                  request_graphs: int,
-                 n_experts_per_token: int,
+                 k_experts_per_token: int,
                  max_T: int = None
                  ) -> None:
         self.request_graphs = request_graphs
         self.n_layers: int = n_layers
         self.per_token_latency_slo_ms: float = per_token_latency_slo_ms
-        self.n_experts_per_token: int = n_experts_per_token
-        solve_using_ilp_model(request_graphs, n_experts_per_token, 1, 1)
+        self.k_experts_per_token: int = k_experts_per_token
+        solve_using_ilp_model(request_graphs, k_experts_per_token, 1, 1)

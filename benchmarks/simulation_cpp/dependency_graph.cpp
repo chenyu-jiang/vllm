@@ -117,7 +117,7 @@ void RequestGraph::Execute(GraphNodePtr node) {
   }
 }
 
-GraphNodes RequestGraph::GetNodes() { return nodes_; }
+const GraphNodes& RequestGraph::GetNodes() const { return nodes_; }
 
 void RequestGraph::InitFrontier_() {
   frontier_.clear();

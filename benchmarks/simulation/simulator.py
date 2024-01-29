@@ -165,10 +165,10 @@ def main(args):
     scheduler_kwargs = {}
     if args.strategy == "ILP":
         scheduler_kwargs["request_graphs"] = graphs
-        scheduler_kwargs["n_experts_per_token"] = n_experts
+        scheduler_kwargs["k_experts_per_token"] = n_experts
         scheduler_kwargs["max_T"] = 48
     elif args.strategy.startswith("PT"):
-        scheduler_kwargs["n_experts_per_token"] = n_experts
+        scheduler_kwargs["k_experts_per_token"] = n_experts
         scheduler_kwargs["graphs"] = graphs
         if args.strategy == "PTLW":
             scheduler_kwargs["min_candidates_per_expert"] = args.min_candidates_per_expert

@@ -19,7 +19,7 @@ def create_is_gt0_integer_var(model: gp.Model, x: gp.Var, big_M: float = 1000):
     return z
 
 def init_ilp_model(request_graphs: List[RequestGraph],
-                   n_experts_per_token: int,
+                   k_experts_per_token: int,
                    attn_cost: float,
                    expert_cost: float,
                    max_T: int = None):
@@ -59,7 +59,7 @@ def init_ilp_model(request_graphs: List[RequestGraph],
         expert_nodes_vars = []
         for i in range(len(request_graphs)):
             for j in range(max_js[i]):
-                if j % (n_experts_per_token + 1) == 0:
+                if j % (k_experts_per_token + 1) == 0:
                     attn_nodes_vars.append(x_per_request[i][j, t])
                 else:
                     expert_nodes_vars.append(x_per_request[i][j, t])
@@ -169,11 +169,11 @@ class ILP(ScheduleStrategy):
                  n_layers: int,
                  per_token_latency_slo_ms: float,
                  request_graphs: int,
-                 n_experts_per_token: int,
+                 k_experts_per_token: int,
                  max_T: int = None
                  ) -> None:
         self.request_graphs = request_graphs
         self.n_layers: int = n_layers
         self.per_token_latency_slo_ms: float = per_token_latency_slo_ms
-        self.n_experts_per_token: int = n_experts_per_token
-        init_ilp_model(request_graphs, n_experts_per_token, 1, 1, max_T=max_T)
+        self.k_experts_per_token: int = k_experts_per_token
+        init_ilp_model(request_graphs, k_experts_per_token, 1, 1, max_T=max_T)

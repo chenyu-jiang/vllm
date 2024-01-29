@@ -5,17 +5,13 @@
 
 namespace dependency_graph {
 
-void GraphNode::AddChild(GraphNode& child) {
-  children_.push_back(&child);
-}
+void GraphNode::AddChild(GraphNodePtr child) { children_.push_back(child); }
 
-void GraphNode::AddParent(GraphNode& parent) {
-  parents_.push_back(&parent);
-}
+void GraphNode::AddParent(GraphNodePtr parent) { parents_.push_back(parent); }
 
 bool GraphNode::IsReady() const {
   for (const auto& parent : parents_) {
-    if (!parent->is_executed_) {
+    if (!(parent->is_executed_)) {
       return false;
     }
   }
@@ -52,8 +48,9 @@ GraphNodes DecodeNode::Execute() {
   GraphNodes ready_children = GraphNode::Execute();
   GraphNodes filtered_children;
   for (const auto& child : ready_children) {
-    if (child->Type() == NodeType::kFin || (child->Type() == NodeType::kDecode &&
-                                           child->token_index > token_index)) {
+    if (child->Type() == NodeType::kFin ||
+        (child->Type() == NodeType::kAttn &&
+         child->token_index > token_index)) {
       // this is the last node for a token
       is_last_node_for_token_ = true;
     }
@@ -70,14 +67,13 @@ NodeType AttnNode::Type() const { return NodeType::kAttn; }
 
 NodeType ExpertNode::Type() const { return NodeType::kExpert; }
 
-void RequestGraph::InitFromNodes(
-    std::vector<std::vector<GraphNode>>& from_nodes) {
+void RequestGraph::InitFromNodes(std::vector<GraphNodes>& from_nodes) {
   nodes_.clear();
   for (size_t i = 1; i < from_nodes.size(); i++) {
     for (auto& node : from_nodes[i]) {
       for (auto& parent : from_nodes[i - 1]) {
-        node.AddParent(parent);
-        parent.AddChild(node);
+        node->AddParent(parent);
+        parent->AddChild(node);
       }
     }
   }
@@ -88,50 +84,49 @@ void RequestGraph::InitFromNodes(
   }
   // sort nodes by node_id
   std::sort(nodes_.begin(), nodes_.end(),
-            [](const GraphNode& a, const GraphNode& b) {
-              return a.node_id < b.node_id;
+            [](const GraphNodePtr a, const GraphNodePtr b) {
+              return a->node_id < b->node_id;
             });
   InitFrontier_();
 }
 
-GraphNodes RequestGraph::GetFrontier() const { return frontier_; }
+const GraphNodes& RequestGraph::GetFrontier() const { return frontier_; }
 
-void RequestGraph::Execute(GraphNode& node) {
-  if (node.req_id != req_id) {
+void RequestGraph::Execute(GraphNodePtr node) {
+  if (node->req_id != req_id) {
     throw std::runtime_error(
         "RequestGraph::Execute() called with node from "
         "different request");
   }
-  if (!node.IsReady()) {
+  if (!node->IsReady()) {
     throw std::runtime_error(
         "RequestGraph::Execute() called with node that "
         "is not ready");
   }
-  std::remove(frontier_.begin(), frontier_.end(), &node);
-  GraphNodes ready_children = node.Execute();
+  // remove node from frontier
+  auto it = std::find(frontier_.begin(), frontier_.end(), node);
+  if (it == frontier_.end()) {
+    throw std::runtime_error(
+        "RequestGraph::Execute() called with node that "
+        "is not in frontier");
+  }
+  frontier_.erase(it);
+  GraphNodes ready_children = node->Execute();
   for (const auto& child : ready_children) {
     frontier_.push_back(child);
   }
 }
 
-GraphNodes RequestGraph::GetNodes() {
-  GraphNodes nodes;
-  for (GraphNode& node : nodes_) {
-    nodes.push_back(&node);
-  }
-  return nodes;
-}
+GraphNodes RequestGraph::GetNodes() { return nodes_; }
 
 void RequestGraph::InitFrontier_() {
   frontier_.clear();
   for (auto& node : nodes_) {
-    if (node.IsReady()) {
-      frontier_.push_back(&node);
+    if (node->IsReady()) {
+      frontier_.push_back(node);
     }
   }
 }
-
-
 
 RequestGraphs BuildGraphs(
     const std::vector<PerTokenExpertIds>& expert_selections,
@@ -150,28 +145,29 @@ RequestGraphs BuildGraphs(
                               decoded_token_ids[req_id]);
     int node_id_counter = 0;
     auto get_next_node_id = [&node_id_counter]() { return node_id_counter++; };
-    std::vector<std::vector<GraphNode>> nodes;
-    for (size_t token_index = 0; token_index < decoded_token_ids[req_id].size();
-         token_index++) {
+    std::vector<GraphNodes> nodes;
+    for (size_t token_index = 0;
+         token_index < decoded_token_ids[req_id].size(); token_index++) {
       for (int layer_id = 0; layer_id < n_layers; layer_id++) {
         const ExpertIds& expert_ids =
             expert_selections[req_id][token_index][layer_id];
-        auto attn_node =
-            AttnNode(get_next_node_id(), req_id, layer_id,
-                     context_token_ids[req_id].size(), token_index);
+        auto attn_node = std::shared_ptr<GraphNode>(
+            new AttnNode(get_next_node_id(), req_id, layer_id,
+                         context_token_ids[req_id].size(), token_index));
         nodes.push_back({attn_node});
         // experts
-        std::vector<GraphNode> expert_nodes;
+        GraphNodes expert_nodes;
         for (int expert_id : expert_ids) {
-          auto expert_node =
-              ExpertNode(get_next_node_id(), req_id, layer_id, expert_id,
-                         context_token_ids[req_id].size(), token_index);
+          auto expert_node = std::shared_ptr<GraphNode>(
+              new ExpertNode(get_next_node_id(), req_id, layer_id, expert_id,
+                             context_token_ids[req_id].size(), token_index));
           expert_nodes.push_back(expert_node);
         }
         nodes.push_back(expert_nodes);
       }
     }
-    nodes.push_back({FinNode(get_next_node_id(), req_id, n_layers)});
+    nodes.push_back({std::shared_ptr<GraphNode>(
+        new FinNode(get_next_node_id(), req_id, n_layers))});
     graph.InitFromNodes(nodes);
     graphs.emplace_back(std::move(graph));
   }

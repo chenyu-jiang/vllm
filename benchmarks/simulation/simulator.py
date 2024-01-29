@@ -2,6 +2,7 @@ import os
 from typing import List, Dict, Optional, Callable
 import argparse
 import tqdm
+import time
 
 
 from vllm.transformers_utils.cost_model import ProfileBasedCostModel
@@ -176,7 +177,9 @@ def main(args):
                                      per_token_latency_slo_ms=args.per_token_latency_slo_ms,
                                      **scheduler_kwargs)
     simulator = Simulator(graphs, cost_model, strategy, args.per_token_latency_slo_ms, args.max_batch_size)
+    t = time.time()
     simulator.simulate()
+    elapsed = time.time() - t
     stats = simulator.get_latency_stats()
     # check that all requests are completed
     for graph in graphs:
@@ -186,7 +189,7 @@ def main(args):
             "Request {} has {} tokens, but only {} tokens are completed.".format(
                 req_id, len(graph.decoded_token_ids), len(stat._per_token_finish_time)
             )
-    print("Finished {} requests.".format(len(stats)))
+    print("Finished {} requests in {}s.".format(len(stats), elapsed))
     flattened_token_latencies = [latency for stat in stats.values() for latency in stat.get_per_token_latencies()[1:]]
     if hasattr(strategy, "_activated_experts_history"):
         print("Avg activated experts per batch: {}".format(sum(strategy._activated_experts_history) / len(strategy._activated_experts_history)))

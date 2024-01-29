@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import List, Tuple, Optional, Callable
 import argparse
 import tqdm
+import time
 
 import simulator
 
@@ -149,11 +150,13 @@ def main(args):
         cost_model = ProfileBasedCostModel(args.cost_model_dir)
         cost_model.save(cm_save_path)
 
+    t = time.time()
     stats, throughput, avg_cost_per_step, peak_kv_tokens, avg_act_experts = \
         simulator.run_simulation(cost_model, expert_selection_list, context_list, output_list, n_layers, n_experts,
                                  args.max_batch_size, args.per_token_latency_slo, args.strategy)
-
-    print("Finished {} requests.".format(len(stats)))
+    elapsed = time.time() - t
+    print("")
+    print("Finished {} requests in {}s.".format(len(stats), elapsed))
     flattened_token_latencies = [latency for stat in stats.values() for latency in stat.get_per_token_latencies()[1:]]
     print("Avg activated experts per batch: {}".format(avg_act_experts))
     print("Avg latency: {} ms.".format(sum(flattened_token_latencies) / len(flattened_token_latencies)))

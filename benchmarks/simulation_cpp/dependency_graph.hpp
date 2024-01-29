@@ -1,15 +1,15 @@
 #pragma once
 
+#include <iostream>
+#include <memory>
 #include <vector>
 
-
-#define ENABLE_LOG
+// #define ENABLE_LOG
 
 #ifdef ENABLE_LOG
-#  include <iostream>
-#  define LOG(x) std::cout << x
+#define LOG(x) std::cout << x
 #else
-#  define LOG(x) (void) 0
+#define LOG(x) (void)0
 #endif
 
 namespace dependency_graph {
@@ -22,7 +22,20 @@ using PerLayerExpertIds = std::vector<ExpertIds>;
 using PerTokenExpertIds = std::vector<PerLayerExpertIds>;
 
 class GraphNode;
-using GraphNodes = std::vector<GraphNode*>;
+using GraphNodePtr = std::shared_ptr<GraphNode>;
+using GraphNodes = std::vector<GraphNodePtr>;
+class DecodeNode;
+using DecodeNodePtr = std::shared_ptr<DecodeNode>;
+using DecodeNodes = std::vector<DecodeNodePtr>;
+class ExpertNode;
+using ExpertNodePtr = std::shared_ptr<ExpertNode>;
+using ExpertNodes = std::vector<ExpertNodePtr>;
+class AttnNode;
+using AttnNodePtr = std::shared_ptr<AttnNode>;
+using AttnNodes = std::vector<AttnNodePtr>;
+class FinNode;
+using FinNodePtr = std::shared_ptr<FinNode>;
+using FinNodes = std::vector<FinNodePtr>;
 
 class RequestGraph;
 using RequestGraphs = std::vector<RequestGraph>;
@@ -35,6 +48,27 @@ enum class NodeType {
   kFin,
 };
 
+inline std::ostream& operator<<(std::ostream& os, const NodeType& type) {
+  switch (type) {
+    case NodeType::kBase:
+      os << "kBase";
+      break;
+    case NodeType::kDecode:
+      os << "kDecode";
+      break;
+    case NodeType::kAttn:
+      os << "kAttn";
+      break;
+    case NodeType::kExpert:
+      os << "kExpert";
+      break;
+    case NodeType::kFin:
+      os << "kFin";
+      break;
+  }
+  return os;
+}
+
 class GraphNode {
  public:
   GraphNode(int node_id = 0, int req_id = 0, int layer_id = 0,
@@ -45,8 +79,8 @@ class GraphNode {
         prompt_len(prompt_len),
         token_index(token_index) {}
 
-  void AddChild(GraphNode& child);
-  void AddParent(GraphNode& parent);
+  void AddChild(GraphNodePtr child);
+  void AddParent(GraphNodePtr parent);
   bool IsReady() const;
 
   virtual NodeType Type() const;
@@ -121,16 +155,15 @@ class RequestGraph {
   TokenIds prompt_token_ids;
   TokenIds decoded_token_ids;
 
-  void InitFromNodes(
-      std::vector<std::vector<GraphNode>>& from_nodes);
-  GraphNodes GetFrontier() const;
-  void Execute(GraphNode& node);
+  void InitFromNodes(std::vector<GraphNodes>& from_nodes);
+  const GraphNodes& GetFrontier() const;
+  void Execute(GraphNodePtr node);
   GraphNodes GetNodes();
 
  protected:
   void InitFrontier_();
   GraphNodes frontier_;
-  std::vector<GraphNode> nodes_;
+  GraphNodes nodes_;
 };
 
 RequestGraphs BuildGraphs(

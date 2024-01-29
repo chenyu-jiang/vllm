@@ -5,8 +5,13 @@
 namespace stragegies {
 namespace fcfs_strategy {
 
+using dependency_graph::AttnNode;
+using dependency_graph::AttnNodes;
 using dependency_graph::ExpertNode;
+using dependency_graph::ExpertNodes;
 using dependency_graph::GraphNode;
+using dependency_graph::GraphNodePtr;
+using dependency_graph::GraphNodes;
 
 FCFSStrategy::FCFSStrategy(const RequestGraphs& graphs,
                            const StrategyConfig& config)
@@ -31,33 +36,42 @@ ScheduleResult FCFSStrategy::Schedule(
     // first try to execute the next token of the current batch
     GraphNodes ready_first_layer_attn_nodes;
     for (const auto& node : ready_nodes) {
-      for (const auto& it : prev_batch_requests_) {
-        if (node->req_id == it.first && node->token_index - 1 == it.second) {
-          ready_first_layer_attn_nodes.push_back(node);
-          current_batch_requests_.push_back({node->req_id, node->token_index});
-        }
+      if (node->layer_id == 0 && node->Type() == NodeType::kAttn) {
+        ready_first_layer_attn_nodes.push_back(node);
       }
     }
-    if ((int)ready_first_layer_attn_nodes.size() < max_batch_size) {
+    for (const auto& node : ready_first_layer_attn_nodes) {
+      if (prev_batch_requests_.find({node->req_id, node->token_index - 1}) !=
+          prev_batch_requests_.end()) {
+        current_batch_requests_.insert({node->req_id, node->token_index});
+      }
+    }
+    if ((int)current_batch_requests_.size() < max_batch_size) {
+      if (current_layer_ != 0 || current_phase_ != NodeType::kAttn) {
+        throw std::runtime_error(
+            "ready_first_layer_attn_nodes is not full but current_layer_ is "
+            "not 0 or current_phase_ is not kAttn");
+      }
       // schedule all first layer Attn requests in FCFS order
       // first sort ready nodes by enqueue time
-      GraphNodes sorted_ready_nodes = ready_nodes;
+      GraphNodes sorted_ready_nodes = ready_first_layer_attn_nodes;
       std::sort(sorted_ready_nodes.begin(), sorted_ready_nodes.end(),
-                [&](const GraphNode* a, const GraphNode* b) {
-                  return request_stats.at(a->req_id).enqueue_time < b->req_id;
+                [&](const GraphNodePtr a, const GraphNodePtr b) {
+                  return request_stats.at(a->req_id).enqueue_time <
+                         request_stats.at(b->req_id).enqueue_time;
                 });
       for (const auto& node : sorted_ready_nodes) {
-        if (node->layer_id == current_layer_ &&
-            node->Type() == NodeType::kAttn) {
-          for (const auto& it : current_batch_requests_) {
-            if (node->req_id == it.first && node->token_index == it.second) {
-              ready_first_layer_attn_nodes.push_back(node);
-              current_batch_requests_.push_back(
-                  {node->req_id, node->token_index});
-              if ((int)ready_first_layer_attn_nodes.size() == max_batch_size) {
-                break;
-              }
-            }
+        bool in_current_batch = false;
+        for (const auto& it : current_batch_requests_) {
+          if (node->req_id == it.first && node->token_index == it.second) {
+            in_current_batch = true;
+            break;
+          }
+        }
+        if (!in_current_batch) {
+          current_batch_requests_.insert({node->req_id, node->token_index});
+          if ((int)current_batch_requests_.size() == max_batch_size) {
+            break;
           }
         }
       }
@@ -67,17 +81,16 @@ ScheduleResult FCFSStrategy::Schedule(
   // we assume all nodes are DecodeNodes
   GraphNodes current_batch_ready_nodes;
   for (const auto& node : ready_nodes) {
-    for (const auto& it : current_batch_requests_) {
-      if (node->req_id == it.first && node->token_index == it.second) {
-        current_batch_ready_nodes.push_back(node);
-      }
+    if (current_batch_requests_.find({node->req_id, node->token_index}) !=
+        current_batch_requests_.end()) {
+      current_batch_ready_nodes.push_back(node);
     }
   }
   if (current_batch_ready_nodes.empty()) {
     // current batch is all finished
-    // advance to the next phase
+    // advance to the next batch
     ResetBatch_();
-    Schedule(request_stats, ready_nodes, max_batch_size);
+    return Schedule(request_stats, ready_nodes, max_batch_size);
   }
   // filter out nodes that are not in the current phase
   GraphNodes current_phase_ready_nodes;
@@ -100,9 +113,15 @@ ScheduleResult FCFSStrategy::Schedule(
   // schedule the current phase
   if (current_phase_ == NodeType::kExpert) {
     // schedule one expert at a time
-    std::vector<ExpertNode*> ready_expert_nodes;
+    ExpertNodes ready_expert_nodes;
     for (const auto& node : current_phase_ready_nodes) {
-      ready_expert_nodes.push_back(dynamic_cast<ExpertNode*>(node));
+      ready_expert_nodes.push_back(
+          std::dynamic_pointer_cast<ExpertNode>(node));
+    }
+    if (ready_expert_nodes.empty()) {
+      throw std::runtime_error(
+          "current_phase_ready_nodes is empty but current_phase_ is "
+          "kExpert");
     }
     int expert_id_to_schedule = ready_expert_nodes[0]->expert_id;
     GraphNodes nodes_to_schedule;

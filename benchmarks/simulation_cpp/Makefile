@@ -1,4 +1,5 @@
 CXXFLAGS += -O3 -Wall -shared -std=c++11 -fPIC -fdiagnostics-color
+# CXXFLAGS += -Wall -shared -std=c++11 -fPIC -fdiagnostics-color -g
 OS := $(shell uname)
 ifeq ($(OS),Darwin)
 	CXXFLAGS += -undefined dynamic_lookup

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -15,7 +16,8 @@ enum class ModelComponent {
   kExpert,
 };
 
-extern const std::unordered_map<ModelComponent, std::string> ModelComponentNames;
+extern const std::unordered_map<ModelComponent, std::string>
+    ModelComponentNames;
 
 using ScheduleResult = std::pair<ModelComponent, GraphNodes>;
 
@@ -36,7 +38,7 @@ class StrategyConfig {
 
 class RequestStats {
  public:
-  RequestStats(int req_id=0, float enqueue_time = 0.0)
+  RequestStats(int req_id = 0, float enqueue_time = 0.0)
       : req_id(req_id), enqueue_time(enqueue_time) {}
 
   void RecordTokenFinish(float finish_time);
@@ -48,9 +50,9 @@ class RequestStats {
 
   int req_id;
   float enqueue_time;
+  std::vector<float> per_token_finish_times_;
 
  protected:
-  std::vector<float> per_token_finish_times_;
 };
 
 class Strategy {
@@ -67,5 +69,7 @@ class Strategy {
   const RequestGraphs& graphs_;
   const StrategyConfig config_;
 };
+
+using StrategyPtr = std::shared_ptr<Strategy>;
 
 }  // namespace stragegies

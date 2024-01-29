@@ -1,5 +1,7 @@
 #pragma once
 
+#include <set>
+
 #include "strategy_factory.hpp"
 
 namespace stragegies {
@@ -22,8 +24,8 @@ class FCFSStrategy : public Strategy {
 
   int n_layers_ = 0;
   float per_token_latency_slo_ = 0.0;
-  std::vector<std::pair<int, int>> current_batch_requests_;
-  std::vector<std::pair<int, int>> prev_batch_requests_;
+  std::set<std::pair<int, int>> current_batch_requests_;
+  std::set<std::pair<int, int>> prev_batch_requests_;
   int current_layer_ = 0;
   NodeType current_phase_ = NodeType::kAttn;
   int activated_experts_per_batch_ = 0;

@@ -6,13 +6,13 @@
 #include "../dependency_graph.hpp"
 #include "strategy.hpp"
 
-#define REGISTER_STRATEGY(StrategyName, ClassName)   \
-  StrategyMaker __maker_##StrategyName =             \
-      [](const RequestGraphs& graphs,                \
-         const StrategyConfig& config) -> Strategy { \
-    return ClassName(graphs, config);                \
-  };                                                 \
-  static std::string __reg_##Strategy__COUNTER__ =   \
+#define REGISTER_STRATEGY(StrategyName, ClassName)      \
+  StrategyMaker __maker_##StrategyName =                \
+      [](const RequestGraphs& graphs,                   \
+         const StrategyConfig& config) -> StrategyPtr { \
+    return StrategyPtr(new ClassName(graphs, config));  \
+  };                                                    \
+  static std::string __reg_##Strategy__COUNTER__ =      \
       StrategyFactory::Register(#StrategyName, __maker_##StrategyName);
 
 namespace stragegies {
@@ -20,7 +20,7 @@ namespace stragegies {
 using dependency_graph::RequestGraphs;
 
 using StrategyMaker =
-    std::function<Strategy(const RequestGraphs&, const StrategyConfig&)>;
+    std::function<StrategyPtr(const RequestGraphs&, const StrategyConfig&)>;
 
 class StrategyFactory {
   // Singleton class managing all registered strategies.
@@ -31,8 +31,8 @@ class StrategyFactory {
 
   static std::string Register(const std::string& name, StrategyMaker maker);
 
-  static Strategy Make(const std::string& name, const RequestGraphs& graphs,
-                       const StrategyConfig& config);
+  static StrategyPtr Make(const std::string& name, const RequestGraphs& graphs,
+                          const StrategyConfig& config);
 
   static bool Has(const std::string& name);
 

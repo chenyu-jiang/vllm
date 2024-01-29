@@ -14,9 +14,9 @@ std::string StrategyFactory::Register(const std::string& name,
   return name;
 }
 
-Strategy StrategyFactory::Make(const std::string& name,
-                               const RequestGraphs& graphs,
-                               const StrategyConfig& config) {
+StrategyPtr StrategyFactory::Make(const std::string& name,
+                                  const RequestGraphs& graphs,
+                                  const StrategyConfig& config) {
   auto& factory = Get();
   return factory.makers_[name](graphs, config);
 }

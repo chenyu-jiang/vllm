@@ -3,8 +3,8 @@
 namespace stragegies {
 
 const std::unordered_map<ModelComponent, std::string> ModelComponentNames = {
-  {ModelComponent::kAttnGate, "attn_gate"},
-  {ModelComponent::kExpert, "expert"},
+    {ModelComponent::kAttnGate, "attn_gate"},
+    {ModelComponent::kExpert, "expert"},
 };
 
 void StrategyConfig::Set(const std::string& key, int value) {
@@ -98,7 +98,8 @@ ScheduleResult Strategy::Schedule(
 }
 
 float Strategy::GetAvgActivatedExperts() const {
-  throw std::runtime_error("GetAvgActivatedExperts not implemented in Strategy Base.");
+  throw std::runtime_error(
+      "GetAvgActivatedExperts not implemented in Strategy Base.");
 }
 
 }  // namespace stragegies

@@ -40,6 +40,8 @@ using FinNodes = std::vector<FinNodePtr>;
 class RequestGraph;
 using RequestGraphs = std::vector<RequestGraph>;
 
+void printProgress(const std::string& desc, double percentage);
+
 enum class NodeType {
   kBase,
   kDecode,

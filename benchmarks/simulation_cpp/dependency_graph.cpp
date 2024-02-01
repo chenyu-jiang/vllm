@@ -5,6 +5,22 @@
 
 namespace dependency_graph {
 
+#define PBSTR "||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||"
+#define PBWIDTH 60
+
+void printProgress(const std::string& desc, double percentage) {
+  static double last_percentage = 0;
+  if (percentage > last_percentage && percentage - last_percentage < 0.01) {
+    return;
+  }
+  int val = (int)(percentage * 100);
+  int lpad = (int)(percentage * PBWIDTH);
+  int rpad = PBWIDTH - lpad;
+  printf("\r%s: %3d%% [%.*s%*s]", desc.c_str(), val, lpad, PBSTR, rpad, "");
+  fflush(stdout);
+  last_percentage = percentage;
+}
+
 void GraphNode::AddChild(GraphNodePtr child) { children_.push_back(child); }
 
 void GraphNode::AddParent(GraphNodePtr parent) { parents_.push_back(parent); }
@@ -170,6 +186,8 @@ RequestGraphs BuildGraphs(
         new FinNode(get_next_node_id(), req_id, n_layers))});
     graph.InitFromNodes(nodes);
     graphs.emplace_back(std::move(graph));
+    printProgress("Building graphs",
+                  (double)(req_id + 1) / (double)expert_selections.size());
   }
   return graphs;
 }

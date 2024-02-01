@@ -40,6 +40,13 @@ std::string StrategyConfig::GetString(const std::string& key) const {
   return str_config_.at(key);
 }
 
+RequestStats::RequestStats(int req_id, float enqueue_time, int prompt_len,
+                           int output_len)
+    : req_id(req_id),
+      prompt_len(prompt_len),
+      output_len(output_len),
+      enqueue_time(enqueue_time) {}
+
 void RequestStats::RecordTokenFinish(float finish_time) {
   per_token_finish_times_.push_back(finish_time);
 }
@@ -80,9 +87,10 @@ std::vector<float> RequestStats::GetPerTokenLatencies() const {
   return latencies;
 }
 
-float RequestStats::GetTimeSinceLastToken(float current_time) {
+float RequestStats::GetTimeSinceLastToken(float current_time,
+                                          bool include_first_token) const {
   if (per_token_finish_times_.empty()) {
-    return current_time - enqueue_time;
+    return include_first_token ? current_time - enqueue_time : 0.0;
   }
   return current_time - per_token_finish_times_.back();
 }
@@ -91,15 +99,35 @@ int RequestStats::GetNumTokensDecoded() const {
   return per_token_finish_times_.size();
 }
 
+int RequestStats::GetTotalContextLength() const {
+  return prompt_len + output_len;
+}
+
 ScheduleResult Strategy::Schedule(
     const std::unordered_map<int, RequestStats>& request_stats,
-    const GraphNodes& ready_nodes, int max_batch_size) {
+    const GraphNodes& ready_nodes, float current_time) {
   throw std::runtime_error("Schedule not implemented in Strategy Base.");
 }
 
 float Strategy::GetAvgActivatedExperts() const {
   throw std::runtime_error(
       "GetAvgActivatedExperts not implemented in Strategy Base.");
+}
+
+float Strategy::GetAvgBatchSize() const {
+  throw std::runtime_error(
+      "GetAvgBatchSize not implemented in Strategy Base.");
+}
+
+void Strategy::RecordNodeLatency(const NodeType& node_type, float latency) {
+  if (avg_node_latency_.find(node_type) == avg_node_latency_.end()) {
+    avg_node_latency_[node_type] = {latency, 1};
+  } else {
+    auto& latency_pair = avg_node_latency_[node_type];
+    latency_pair.first = (latency_pair.first * latency_pair.second + latency) /
+                         (latency_pair.second + 1);
+    latency_pair.second += 1;
+  }
 }
 
 }  // namespace stragegies

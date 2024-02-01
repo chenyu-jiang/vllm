@@ -17,12 +17,14 @@ FCFSStrategy::FCFSStrategy(const RequestGraphs& graphs,
                            const StrategyConfig& config)
     : Strategy(graphs, config) {
   n_layers_ = config.GetInt("n_layers");
+  max_batch_size_ = config.GetInt("max_batch_size");
+  max_kv_tokens_ = config.GetInt("max_kv_tokens");
   per_token_latency_slo_ = config_.GetFloat("per_token_latency_slo");
 }
 
 ScheduleResult FCFSStrategy::Schedule(
     const std::unordered_map<int, RequestStats>& request_stats,
-    const GraphNodes& ready_nodes, int max_batch_size) {
+    const GraphNodes& ready_nodes, float current_time) {
   if (ready_nodes.empty()) {
     // no more requests to schedule
     return ScheduleResult(ModelComponent::kAttnGate, {});
@@ -34,6 +36,7 @@ ScheduleResult FCFSStrategy::Schedule(
           "current_batch_requests_ is empty but current_layer_ is not 0");
     }
     // first try to execute the next token of the current batch
+    int current_batch_kv_tokens = 0;
     GraphNodes ready_first_layer_attn_nodes;
     for (const auto& node : ready_nodes) {
       if (node->layer_id == 0 && node->Type() == NodeType::kAttn) {
@@ -44,9 +47,12 @@ ScheduleResult FCFSStrategy::Schedule(
       if (prev_batch_requests_.find({node->req_id, node->token_index - 1}) !=
           prev_batch_requests_.end()) {
         current_batch_requests_.insert({node->req_id, node->token_index});
+        current_batch_kv_tokens +=
+            request_stats.at(node->req_id).prompt_len + request_stats.at(node->req_id).GetNumTokensDecoded();
       }
     }
-    if ((int)current_batch_requests_.size() < max_batch_size) {
+    if ((int)current_batch_requests_.size() < max_batch_size_ &&
+        current_batch_kv_tokens < max_kv_tokens_) {
       if (current_layer_ != 0 || current_phase_ != NodeType::kAttn) {
         throw std::runtime_error(
             "ready_first_layer_attn_nodes is not full but current_layer_ is "
@@ -61,21 +67,23 @@ ScheduleResult FCFSStrategy::Schedule(
                          request_stats.at(b->req_id).enqueue_time;
                 });
       for (const auto& node : sorted_ready_nodes) {
-        bool in_current_batch = false;
-        for (const auto& it : current_batch_requests_) {
-          if (node->req_id == it.first && node->token_index == it.second) {
-            in_current_batch = true;
-            break;
-          }
-        }
-        if (!in_current_batch) {
+        if (current_batch_requests_.find({node->req_id, node->token_index}) ==
+            current_batch_requests_.end()) {
           current_batch_requests_.insert({node->req_id, node->token_index});
-          if ((int)current_batch_requests_.size() == max_batch_size) {
+          current_batch_kv_tokens +=
+              request_stats.at(node->req_id).GetTotalContextLength();
+          if ((int)current_batch_requests_.size() == max_batch_size_ ||
+              current_batch_kv_tokens >= max_kv_tokens_) {
             break;
           }
         }
       }
     }
+    LOG("Scheduling a batch of "
+        << current_batch_requests_.size()
+        << " requests, total KV size: " << current_batch_kv_tokens << " / "
+        << max_kv_tokens_ << " tokens." << std::endl);
+    UpdateAvgBatchSize_(current_batch_requests_.size());
   }
   // first test if the current batch is all finished
   // we assume all nodes are DecodeNodes
@@ -90,7 +98,7 @@ ScheduleResult FCFSStrategy::Schedule(
     // current batch is all finished
     // advance to the next batch
     ResetBatch_();
-    return Schedule(request_stats, ready_nodes, max_batch_size);
+    return Schedule(request_stats, ready_nodes, current_time);
   }
   // filter out nodes that are not in the current phase
   GraphNodes current_phase_ready_nodes;
@@ -130,7 +138,7 @@ ScheduleResult FCFSStrategy::Schedule(
         nodes_to_schedule.push_back(node);
       }
     }
-    activated_experts_per_batch_ += 1;
+    activated_experts_per_layer_ += 1;
     return {ModelComponent::kExpert, nodes_to_schedule};
   }
   // schedule all attn nodes together
@@ -141,26 +149,41 @@ void FCFSStrategy::AdvancePhase_() {
   if (current_phase_ == NodeType::kAttn) {
     current_phase_ = NodeType::kExpert;
   } else {
+    UpdateAvgActivatedExperts_(activated_experts_per_layer_);
+    activated_experts_per_layer_ = 0;
     current_phase_ = NodeType::kAttn;
     current_layer_ += 1;
   }
 }
 
 void FCFSStrategy::ResetBatch_() {
+  UpdateAvgActivatedExperts_(activated_experts_per_layer_);
+  activated_experts_per_layer_ = 0;
   prev_batch_requests_ = current_batch_requests_;
   current_batch_requests_.clear();
   current_phase_ = NodeType::kAttn;
   current_layer_ = 0;
-  activated_experts_history_.push_back(activated_experts_per_batch_);
-  activated_experts_per_batch_ = 0;
 }
 
 float FCFSStrategy::GetAvgActivatedExperts() const {
-  float sum = 0.0;
-  for (const auto& it : activated_experts_history_) {
-    sum += it;
-  }
-  return sum / activated_experts_history_.size();
+  return avg_activated_experts_.first;
+}
+
+float FCFSStrategy::GetAvgBatchSize() const { return avg_batch_size_.first; }
+
+void FCFSStrategy::UpdateAvgActivatedExperts_(int n_experts) {
+  avg_activated_experts_.first =
+      (avg_activated_experts_.first * avg_activated_experts_.second +
+       n_experts) /
+      (avg_activated_experts_.second + 1);
+  avg_activated_experts_.second += 1;
+}
+
+void FCFSStrategy::UpdateAvgBatchSize_(int batch_size) {
+  avg_batch_size_.first =
+      (avg_batch_size_.first * avg_batch_size_.second + batch_size) /
+      (avg_batch_size_.second + 1);
+  avg_batch_size_.second += 1;
 }
 
 }  // namespace fcfs_strategy

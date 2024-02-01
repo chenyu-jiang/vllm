@@ -9,6 +9,7 @@
 namespace stragegies {
 
 using dependency_graph::GraphNodes;
+using dependency_graph::NodeType;
 using dependency_graph::RequestGraphs;
 
 enum class ModelComponent {
@@ -38,17 +39,21 @@ class StrategyConfig {
 
 class RequestStats {
  public:
-  RequestStats(int req_id = 0, float enqueue_time = 0.0)
-      : req_id(req_id), enqueue_time(enqueue_time) {}
+  RequestStats(int req_id = 0, float enqueue_time = 0.0, int prompt_len = 0,
+               int output_len = 0);
 
   void RecordTokenFinish(float finish_time);
   float GetFirstTokenlatency() const;
   float GetAvgLatency(bool include_first_token) const;
   std::vector<float> GetPerTokenLatencies() const;
-  float GetTimeSinceLastToken(float current_time);
+  float GetTimeSinceLastToken(float current_time,
+                              bool include_first_token) const;
   int GetNumTokensDecoded() const;
+  int GetTotalContextLength() const;
 
   int req_id;
+  int prompt_len;
+  int output_len;
   float enqueue_time;
   std::vector<float> per_token_finish_times_;
 
@@ -61,13 +66,17 @@ class Strategy {
       : graphs_(graphs), config_(config) {}
   virtual ScheduleResult Schedule(
       const std::unordered_map<int, RequestStats>& request_stats,
-      const GraphNodes& ready_nodes, int max_batch_size = -1);
+      const GraphNodes& ready_nodes, float current_time);
 
   virtual float GetAvgActivatedExperts() const;
+  virtual float GetAvgBatchSize() const;
+
+  void RecordNodeLatency(const NodeType& node_type, float latency);
 
  protected:
   const RequestGraphs& graphs_;
   const StrategyConfig config_;
+  std::unordered_map<NodeType, std::pair<float, int>> avg_node_latency_;
 };
 
 using StrategyPtr = std::shared_ptr<Strategy>;

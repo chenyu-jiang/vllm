@@ -10,40 +10,21 @@
 // #define BENCHMARK
 
 #ifdef BENCHMARK
-#define DEF_BENCH_NAMED(name)                       \
-  auto name##_accum = std::chrono::microseconds(0); \
-  auto name##_cnter = 0;
+#define DEF_BENCH_NAMED(name) auto name##_accum = std::chrono::microseconds(0);
 #define START_BENCH(name) auto name##_begin = std::chrono::steady_clock::now();
 #define END_BENCH(name)                                                  \
   auto name##_end = std::chrono::steady_clock::now();                    \
   name##_accum += std::chrono::duration_cast<std::chrono::microseconds>( \
-      name##_end - name##_begin);                                        \
-  name##_cnter++;
+      name##_end - name##_begin);
 #define PRINT_BENCH(name)                       \
   printf("%s took %f seconds to run.\n", #name, \
-         (double)name##_accum.count() / 1000000 / name##_cnter);
+         (double)name##_accum.count() / 1000000);
 #else
 #define DEF_BENCH_NAMED(name) (void)0
 #define START_BENCH(name) (void)0
 #define END_BENCH(name) (void)0
 #define PRINT_BENCH(name) (void)0
 #endif
-
-#define PBSTR "||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||"
-#define PBWIDTH 60
-
-void printProgress(double percentage) {
-  static double last_percentage = 0;
-  if (percentage - last_percentage < 0.01) {
-    return;
-  }
-  int val = (int)(percentage * 100);
-  int lpad = (int)(percentage * PBWIDTH);
-  int rpad = PBWIDTH - lpad;
-  printf("\r%3d%% [%.*s%*s]", val, lpad, PBSTR, rpad, "");
-  fflush(stdout);
-  last_percentage = percentage;
-}
 
 namespace py = pybind11;
 
@@ -53,6 +34,7 @@ using dependency_graph::GraphNodes;
 using dependency_graph::NodeType;
 using dependency_graph::PerTokenExpertIds;
 using dependency_graph::TokenIds;
+using stragegies::ModelComponent;
 using stragegies::ModelComponentNames;
 using stragegies::RequestStats;
 using stragegies::StrategyConfig;
@@ -60,15 +42,15 @@ using stragegies::StrategyFactory;
 
 using RequestStatsDict = std::unordered_map<int, RequestStats>;
 using SimulationResult =
-    std::tuple<RequestStatsDict, float, float, float, float>;
+    std::tuple<RequestStatsDict, float, float, float, float, float>;
 
 SimulationResult RunSimulation(
     py::object cost_model,
     const std::vector<PerTokenExpertIds>& expert_selections,
     const std::vector<TokenIds>& context_token_ids,
     const std::vector<TokenIds>& decoded_token_ids, int n_layers,
-    int n_experts, int k_experts_per_token,
-    int max_batch_size, float per_token_latency_slo,
+    int n_experts, int k_experts_per_token, int max_batch_size,
+    int max_kv_tokens, float per_token_latency_slo,
     std::string schedule_strategy) {
   // first check if the schedule strategy is valid
   if (!StrategyFactory::Has(schedule_strategy)) {
@@ -86,6 +68,8 @@ SimulationResult RunSimulation(
   config.Set("n_experts", n_experts);
   config.Set("per_token_latency_slo", per_token_latency_slo);
   config.Set("k_experts_per_token", k_experts_per_token);
+  config.Set("max_batch_size", max_batch_size);
+  config.Set("max_kv_tokens", max_kv_tokens);
   auto strategy =
       StrategyFactory::Make(schedule_strategy, request_graphs, config);
   // prepare variables for simulation
@@ -96,13 +80,16 @@ SimulationResult RunSimulation(
   float current_time = 0.0;
   int total_tokens_processed = 0;
   for (const auto& graph : request_graphs) {
-    request_stats[graph.req_id] = RequestStats(graph.req_id, current_time);
+    request_stats[graph.req_id] =
+        RequestStats(graph.req_id, current_time, graph.prompt_token_ids.size(),
+                     graph.decoded_token_ids.size());
   }
   int requests_finished = 0;
   DEF_BENCH_NAMED(Total);
   DEF_BENCH_NAMED(Schedule);
   DEF_BENCH_NAMED(GetReadyNode);
   DEF_BENCH_NAMED(CostModel);
+  DEF_BENCH_NAMED(UpdateDependency);
   // run simulation
   START_BENCH(Total);
   while (true) {
@@ -134,7 +121,7 @@ SimulationResult RunSimulation(
     LOG("Ready nodes: " << ready_nodes.size() << std::endl);
     START_BENCH(Schedule);
     auto schedule_result =
-        strategy->Schedule(request_stats, ready_nodes, max_batch_size);
+        strategy->Schedule(request_stats, ready_nodes, current_time);
     END_BENCH(Schedule);
     auto& model_component = schedule_result.first;
     auto& scheduled_nodes = schedule_result.second;
@@ -158,8 +145,14 @@ SimulationResult RunSimulation(
     current_time += cost;
     avg_cost_per_step += cost;
     n_steps += 1;
+    if (model_component == ModelComponent::kAttnGate) {
+      strategy->RecordNodeLatency(NodeType::kAttn, cost);
+    } else {
+      strategy->RecordNodeLatency(NodeType::kExpert, cost);
+    }
     LOG("Cost: " << cost << ", Current time: " << current_time << std::endl);
     // release dependency
+    START_BENCH(UpdateDependency);
     for (auto& node : scheduled_nodes) {
       auto& graph = request_graphs[node->req_id];
       graph.Execute(node);
@@ -167,17 +160,17 @@ SimulationResult RunSimulation(
           std::dynamic_pointer_cast<DecodeNode>(node)->IsLastNodeForToken()) {
         request_stats[node->req_id].RecordTokenFinish(current_time);
         total_tokens_processed += 1;
-        LOG("Request " << node->req_id << " finished "
-                       << request_stats[node->req_id].GetNumTokensDecoded()
-                       << " tokens." << std::endl);
         if (request_stats[node->req_id].GetNumTokensDecoded() ==
             (int)graph.decoded_token_ids.size()) {
           requests_finished++;
           // all tokens are decoded
-          printProgress((double)requests_finished / request_graphs.size());
+          dependency_graph::printProgress(
+              "Simulating: ",
+              (double)requests_finished / request_graphs.size());
         }
       }
     }
+    END_BENCH(UpdateDependency);
   }
   END_BENCH(Total);
   // calculate avg cost per step
@@ -187,27 +180,30 @@ SimulationResult RunSimulation(
   PRINT_BENCH(Schedule);
   PRINT_BENCH(GetReadyNode);
   PRINT_BENCH(CostModel);
-  return {request_stats, throughput, avg_cost_per_step, peak_kv_tokens,
-          strategy->GetAvgActivatedExperts()};
+  PRINT_BENCH(UpdateDependency);
+  return {request_stats,
+          throughput,
+          avg_cost_per_step,
+          peak_kv_tokens,
+          strategy->GetAvgActivatedExperts(),
+          strategy->GetAvgBatchSize()};
 }
 
 PYBIND11_MODULE(simulator, m) {
   m.doc() = "C++ implementation of the simulation algorithm";
   m.def("run_simulation", &RunSimulation, "Run simulation",
-        py::arg("cost_model"),
-        py::arg("expert_selections"),
-        py::arg("context_token_ids"),
-        py::arg("decoded_token_ids"),
-        py::arg("n_layers"),
-        py::arg("n_experts"),
-        py::arg("k_experts_per_token"),
-        py::arg("max_batch_size"),
-        py::arg("per_token_latency_slo"),
+        py::arg("cost_model"), py::arg("expert_selections"),
+        py::arg("context_token_ids"), py::arg("decoded_token_ids"),
+        py::arg("n_layers"), py::arg("n_experts"),
+        py::arg("k_experts_per_token"), py::arg("max_batch_size"),
+        py::arg("max_kv_tokens"), py::arg("per_token_latency_slo"),
         py::arg("schedule_strategy"));
 
   py::class_<RequestStats>(m, "RequestStats")
       .def(py::init<int, float>())
       .def_readwrite("req_id", &RequestStats::req_id)
+      .def_readwrite("prompt_len", &RequestStats::prompt_len)
+      .def_readwrite("output_len", &RequestStats::output_len)
       .def_readwrite("enqueue_time", &RequestStats::enqueue_time)
       .def_readwrite("per_token_finish_times",
                      &RequestStats::per_token_finish_times_)
@@ -216,5 +212,6 @@ PYBIND11_MODULE(simulator, m) {
       .def("get_avg_latency", &RequestStats::GetAvgLatency)
       .def("get_per_token_latencies", &RequestStats::GetPerTokenLatencies)
       .def("get_time_since_last_token", &RequestStats::GetTimeSinceLastToken)
-      .def("get_num_tokens_decoded", &RequestStats::GetNumTokensDecoded);
+      .def("get_num_tokens_decoded", &RequestStats::GetNumTokensDecoded)
+      .def("get_total_context_length", &RequestStats::GetTotalContextLength);
 }

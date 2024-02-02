@@ -33,6 +33,7 @@ using dependency_graph::DecodeNode;
 using dependency_graph::GraphNodes;
 using dependency_graph::NodeType;
 using dependency_graph::PerTokenExpertIds;
+using dependency_graph::RequestGraphRefs;
 using dependency_graph::TokenIds;
 using stragegies::ModelComponent;
 using stragegies::ModelComponentNames;
@@ -51,7 +52,7 @@ SimulationResult RunSimulation(
     const std::vector<TokenIds>& decoded_token_ids, int n_layers,
     int n_experts, int k_experts_per_token, int max_batch_size,
     int max_kv_tokens, float per_token_latency_slo,
-    std::string schedule_strategy) {
+    float request_injection_interval, std::string schedule_strategy) {
   // first check if the schedule strategy is valid
   if (!StrategyFactory::Has(schedule_strategy)) {
     throw std::runtime_error("Invalid schedule strategy: " +
@@ -77,13 +78,10 @@ SimulationResult RunSimulation(
   float peak_kv_tokens = 0.0;
   float avg_cost_per_step = 0.0;
   int n_steps = 0;
-  float current_time = 0.0;
+  float current_time = request_injection_interval;  // skip to first request
   int total_tokens_processed = 0;
-  for (const auto& graph : request_graphs) {
-    request_stats[graph.req_id] =
-        RequestStats(graph.req_id, current_time, graph.prompt_token_ids.size(),
-                     graph.decoded_token_ids.size());
-  }
+  // keep track of currently available requests
+  RequestGraphRefs available_requests;
   int requests_finished = 0;
   DEF_BENCH_NAMED(Total);
   DEF_BENCH_NAMED(Schedule);
@@ -93,12 +91,27 @@ SimulationResult RunSimulation(
   // run simulation
   START_BENCH(Total);
   while (true) {
+    // update available requests
+    int n_requests_to_add =
+        std::min((unsigned long)(current_time / request_injection_interval -
+                                 available_requests.size()),
+                 request_graphs.size() - available_requests.size());
+    LOG("Adding " << n_requests_to_add << " requests." << std::endl);
+    if (n_requests_to_add > 0) {
+      for (int i = 0; i < n_requests_to_add; ++i) {
+        auto& graph = request_graphs[available_requests.size()];
+        available_requests.push_back(graph);
+        request_stats[graph.req_id] = RequestStats(
+            graph.req_id, current_time, graph.prompt_token_ids.size(),
+            graph.decoded_token_ids.size());
+      }
+    }
     // get ready nodes
     START_BENCH(GetReadyNode);
     GraphNodes ready_nodes;
-    ready_nodes.reserve(request_graphs.size() * n_layers * 256);
-    for (const auto& graph : request_graphs) {
-      const auto& graph_ready_nodes = graph.GetFrontier();
+    ready_nodes.reserve(available_requests.size() * n_layers * 256);
+    for (const auto& graph : available_requests) {
+      const auto& graph_ready_nodes = graph.get().GetFrontier();
       ready_nodes.insert(ready_nodes.end(), graph_ready_nodes.begin(),
                          graph_ready_nodes.end());
     }
@@ -126,8 +139,9 @@ SimulationResult RunSimulation(
     auto& model_component = schedule_result.first;
     auto& scheduled_nodes = schedule_result.second;
     if (scheduled_nodes.empty()) {
-      // no more requests to schedule
-      break;
+      // no more requests to schedule, skip time to next request injection
+      current_time = (current_time / request_injection_interval + 1) *
+                     request_injection_interval;
     }
     LOG("Scheduled " << scheduled_nodes.size() << " nodes." << std::endl);
     // calculate cost
@@ -165,12 +179,18 @@ SimulationResult RunSimulation(
           requests_finished++;
           // all tokens are decoded
           dependency_graph::printProgress(
-              "Simulating: ",
+              "Simulating: Running " +
+                  std::to_string(available_requests.size() -
+                                 requests_finished) +
+                  " requests",
               (double)requests_finished / request_graphs.size());
         }
       }
     }
     END_BENCH(UpdateDependency);
+    if (requests_finished == (int)request_graphs.size()) {
+      break;
+    }
   }
   END_BENCH(Total);
   // calculate avg cost per step
@@ -197,7 +217,7 @@ PYBIND11_MODULE(simulator, m) {
         py::arg("n_layers"), py::arg("n_experts"),
         py::arg("k_experts_per_token"), py::arg("max_batch_size"),
         py::arg("max_kv_tokens"), py::arg("per_token_latency_slo"),
-        py::arg("schedule_strategy"));
+        py::arg("request_injection_interval"), py::arg("schedule_strategy"));
 
   py::class_<RequestStats>(m, "RequestStats")
       .def(py::init<int, float>())

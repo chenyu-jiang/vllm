@@ -48,7 +48,8 @@ ScheduleResult FCFSStrategy::Schedule(
           prev_batch_requests_.end()) {
         current_batch_requests_.insert({node->req_id, node->token_index});
         current_batch_kv_tokens +=
-            request_stats.at(node->req_id).prompt_len + request_stats.at(node->req_id).GetNumTokensDecoded();
+            request_stats.at(node->req_id).prompt_len +
+            request_stats.at(node->req_id).GetNumTokensDecoded();
       }
     }
     if ((int)current_batch_requests_.size() < max_batch_size_ &&

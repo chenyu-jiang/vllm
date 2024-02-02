@@ -137,7 +137,7 @@ def load_dataset(
     for req_id, (token_ids, _, orig_context) in tqdm.tqdm(
         enumerate(unique_sequences),
         total=len(unique_sequences),
-        desc="Preparing request graphs",
+        desc="Preparing dataset",
     ):
         decoded_token_ids = [
             token_id_to_output_token[token_id] for token_id in token_ids
@@ -182,16 +182,16 @@ def parse_args():
     parser.add_argument("--truncate-tokens", type=int, default=None)
     parser.add_argument("--repeat-tokens", type=int, default=1)
     parser.add_argument("--truncate-layers", type=int, default=None)
-    parser.add_argument("--max-batch-size", type=int, default=4096)
+    parser.add_argument("--max-batch-size", type=int, default=4096000)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--min-candidates-per-expert", type=int, default=128)
-    parser.add_argument("--per-token-latency-slo", type=float, default=1000.0)
+    parser.add_argument("--per-token-latency-slo", type=float, default=1000000.0)
+    parser.add_argument("--request_injection_interval", type=float, default=0.000001)
     # 512 bytes per token per layer if TP = 8, 1024 if TP=4
     parser.add_argument("--per-token-kv-bytes", type=int, default=512)
     # 40GB - 47 * 2 / 8 GB = 28.25GB for KV Cache if TP = 8
     # 40GB - 47 * 2 / 4 GB = 16.5GB for KV Cache if TP = 4
     parser.add_argument("--memory-limit-mb", type=int, default=28250)
-    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     # scale memory limit if slicing layers
     if args.truncate_layers:
@@ -251,6 +251,7 @@ def main(args):
             )
         ),
         args.per_token_latency_slo,
+        args.request_injection_interval,
         args.strategy,
     )
     elapsed = time.time() - t

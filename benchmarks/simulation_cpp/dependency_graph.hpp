@@ -39,6 +39,7 @@ using FinNodes = std::vector<FinNodePtr>;
 
 class RequestGraph;
 using RequestGraphs = std::vector<RequestGraph>;
+using RequestGraphRefs = std::vector<std::reference_wrapper<RequestGraph>>;
 
 void printProgress(const std::string& desc, double percentage);
 

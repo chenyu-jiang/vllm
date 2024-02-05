@@ -140,6 +140,9 @@ class MixtralMoE(nn.Module):
                                      self.num_total_experts,
                                      bias=False,
                                      linear_method=None)
+        self.expert_hidden_states_ = {}
+        self.expert_dump_counter = {}
+
 
     def forward(self, hidden_states: torch.Tensor, token_ids: List[int] = None) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -184,25 +187,18 @@ class MixtralMoE(nn.Module):
             current_hidden_states = expert_layer(hidden_states).mul_(
                 expert_weights)
             if _EXPERT_ACTIVATION_DUMP_PATH is not None and token_ids and not torch.cuda.is_current_stream_capturing():
-                h5f = h5py.File(f"{_EXPERT_ACTIVATION_DUMP_PATH}_e{expert_idx}.h5", "a")
-                # write expert param to h5 if not exist
-                if "/expert_params" not in h5f:
-                    for w_name, w in expert_layer.named_parameters():
-                        expert_params = bytes()
-                        params_io = io.BytesIO(expert_params)
-                        torch.save(w.cpu(), params_io)
-                        h5f.create_dataset(f"/expert_params/{w_name}", data=np.asarray(params_io.read()))
+                # store the input hidden states
                 for idx, token_id in enumerate(token_ids):
-                    # expert_weights
-                    expert_weights_bytes = bytes()
-                    weight_io = io.BytesIO(expert_weights_bytes)
-                    torch.save(expert_weights[idx].cpu(), weight_io)
-                    h5f.create_dataset(f"/{token_id}/l{self.layer_id}/expert_weights", data=np.asarray(weight_io.read()))
-                    # hidden_states
-                    hidden_states_bytes = bytes()
-                    hidden_io = io.BytesIO(hidden_states_bytes)
-                    torch.save(current_hidden_states[idx].cpu(), hidden_io)
-                    h5f.create_dataset(f"/{token_id}/l{self.layer_id}/hidden_states", data=np.asarray(hidden_io.read()))
+                    if expert_idx not in self.expert_hidden_states_:
+                        self.expert_hidden_states_[expert_idx] = []
+                        self.expert_dump_counter[expert_idx] = 0
+                    self.expert_hidden_states_[expert_idx].append(hidden_states[idx].float().cpu().numpy())
+                    if len(self.expert_hidden_states_[expert_idx]) >= 65536:
+                        # dump to file
+                        concated = np.concatenate(self.expert_hidden_states_[expert_idx], axis=0)
+                        np.savez_compressed(f"{_EXPERT_ACTIVATION_DUMP_PATH}_e{expert_idx}_l{self.layer_id}_{self.expert_dump_counter[expert_idx]}.npz", concated)
+                        self.expert_hidden_states_[expert_idx] = []
+                        self.expert_dump_counter[expert_idx] += 1
             if final_hidden_states is None:
                 final_hidden_states = current_hidden_states
             else:

@@ -338,8 +338,7 @@ class ParallelConfig:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
         self.data_parallel_size = data_parallel_size
-        self.data_parallel_rank = os.environ.get("LOCAL_RANK", None)
-        assert self.data_parallel_rank is not None
+        self.data_parallel_rank = os.environ.get("LOCAL_RANK", 0)
         self.data_parallel_rank = int(self.data_parallel_rank)
         self.worker_use_ray = worker_use_ray
         self.max_parallel_loading_workers = max_parallel_loading_workers

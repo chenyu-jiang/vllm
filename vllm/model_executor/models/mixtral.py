@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Mixtral model."""
+import os
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -31,7 +32,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import MixtralConfig
 
-from vllm._C import moe_ops
+# from vllm._C import moe_ops
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.attention import PagedAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -63,10 +64,35 @@ from vllm.sequence import SamplerOutput
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
+LORA_DIR = os.environ.get("MIXTRAL_LORA_DIR", None)
+LORA_FROM_EXPERT = os.environ.get("MIXTRAL_LORA_FROM_EXPERT", None)
+LORA_TO_EXPERTS_PER_LAYER = os.environ.get("MIXTRAL_LORA_TO_EXPERTS_PER_LAYER", None)
+if LORA_FROM_EXPERT is not None:
+    LORA_FROM_EXPERT = int(LORA_FROM_EXPERT)
+if LORA_TO_EXPERTS_PER_LAYER is not None:
+    LORA_TO_EXPERTS_PER_LAYER = [int(x) for x in LORA_TO_EXPERTS_PER_LAYER.split(",")]
 
 class MixtralParallelism:
     DATA_EXPERT_PARALLEL = "data_expert_parallel"
     TENSOR_EXPERT_PARALLEL = "tensor_expert_parallel"
+
+
+class LoRALinear(nn.Module):
+    def __init__(self, in_features, out_features, r, lora_alpha, dtype):
+        super(LoRALinear, self).__init__()
+        self.lora_A = nn.Linear(in_features, r, bias=False, dtype=dtype)
+        self.lora_B = nn.Linear(r, out_features, bias=False, dtype=dtype)
+        self.scale = lora_alpha
+        self.dtype = dtype
+
+    def forward(self, x):
+        return self.lora_B(self.lora_A(x)) * self.scale
+
+    def load_lora_weight(self, state_dict):
+        self.lora_A.weight.data.copy_(state_dict['lora_A.weight'])
+        self.lora_B.weight.data.copy_(state_dict['lora_B.weight'])
+        self.lora_A.cuda()
+        self.lora_B.cuda()
 
 
 class MixtralMLP(nn.Module):
@@ -98,14 +124,37 @@ class MixtralMLP(nn.Module):
 
         # TODO: Use vllm's SiluAndMul
         self.act_fn = nn.SiLU()
+        self.lora_w1 = None
+        self.lora_w2 = None
+        self.lora_w3 = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         w1_out, _ = self.w1(hidden_states)
+        if self.lora_w1 is not None:
+            w1_out += self.lora_w1(hidden_states)
         w1_out = self.act_fn(w1_out)
         w3_out, _ = self.w3(hidden_states)
+        if self.lora_w3 is not None:
+            w3_out += self.lora_w3(hidden_states)
         current_hidden_states = w1_out * w3_out
-        current_hidden_states, _ = self.w2(current_hidden_states)
-        return current_hidden_states
+        output_hidden_states, _ = self.w2(current_hidden_states)
+        if self.lora_w2 is not None:
+            output_hidden_states += self.lora_w2(current_hidden_states)
+        return output_hidden_states
+
+    def init_lora(self, state_dict, lora_alpha=None):
+        for w_name in ["w1", "w2", "w3"]:
+            w_A = state_dict[f"{w_name}.lora_A.weight"]
+            w_B = state_dict[f"{w_name}.lora_B.weight"]
+            r = w_A.shape[0]
+            in_features = w_A.shape[1]
+            out_features = w_B.shape[0]
+            lora_alpha = lora_alpha if lora_alpha is not None else r
+            setattr(self, f"lora_{w_name}", LoRALinear(in_features, out_features, r, lora_alpha, w_A.dtype))
+            getattr(self, f"lora_{w_name}").load_lora_weight({
+                "lora_A.weight": w_A,
+                "lora_B.weight": w_B
+            })
 
 
 class MixtralTensorParallelMLP(nn.Module):
@@ -147,6 +196,7 @@ class MixtralMoE(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        layer_idx: int = 0,
         parallel_method: str = MixtralParallelism.TENSOR_EXPERT_PARALLEL
     ):
         super().__init__()
@@ -155,6 +205,7 @@ class MixtralMoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.dp_rank = get_data_parallel_rank()
         self.dp_size = get_data_parallel_world_size()
+        self.layer_idx = layer_idx
         self.num_total_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
         self.parallel_method = parallel_method
@@ -210,6 +261,10 @@ class MixtralMoE(nn.Module):
                                                        self.top_k,
                                                        dim=-1)
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+
+        if LORA_DIR is not None:
+            # route FROM_EXPERT to TO_EXPERT instead
+            selected_experts[selected_experts == LORA_FROM_EXPERT] = LORA_TO_EXPERTS_PER_LAYER[self.layer_idx]
 
         if self.parallel_method == MixtralParallelism.TENSOR_EXPERT_PARALLEL:
             final_hidden_states = None
@@ -401,6 +456,7 @@ class MixtralDecoderLayer(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        layer_idx: int = 0,
         parallel_method: str = MixtralParallelism.TENSOR_EXPERT_PARALLEL,
     ) -> None:
         super().__init__()
@@ -417,6 +473,7 @@ class MixtralDecoderLayer(nn.Module):
             linear_method=linear_method)
         self.block_sparse_moe = MixtralMoE(config=config,
                                            linear_method=linear_method,
+                                            layer_idx=layer_idx,
                                            parallel_method=parallel_method)
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -470,8 +527,9 @@ class MixtralModel(nn.Module):
         )
         self.layers = nn.ModuleList([
             MixtralDecoderLayer(config, linear_method=linear_method,
+                                layer_idx=layer_idx,
                                 parallel_method=parallel_method)
-            for _ in range(config.num_hidden_layers)
+            for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -492,6 +550,19 @@ class MixtralModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+    def load_lora_weight(self):
+        if LORA_DIR is None:
+            return
+        assert len(LORA_TO_EXPERTS_PER_LAYER) == len(self.layers)
+        for layer_idx, layer in enumerate(self.layers):
+            expert_indices = layer.block_sparse_moe.expert_indicies
+            for expert_idx in expert_indices:
+                expert_layer = layer.block_sparse_moe.experts[expert_idx]
+                if LORA_TO_EXPERTS_PER_LAYER[layer_idx] == expert_idx:
+                    lora_to_expert = LORA_TO_EXPERTS_PER_LAYER[layer_idx]
+                    print("Loading LoRA weight for expert", expert_idx, "from expert", LORA_FROM_EXPERT)
+                    state_dict = torch.load(os.path.join(LORA_DIR, f"from{LORA_FROM_EXPERT}_to{lora_to_expert}_l{layer_idx}_r128", "lora_model.pt"))
+                    expert_layer.init_lora(state_dict, lora_alpha=128)
 
 class MixtralForCausalLM(nn.Module):
 
@@ -583,3 +654,4 @@ class MixtralForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+        self.model.load_lora_weight()

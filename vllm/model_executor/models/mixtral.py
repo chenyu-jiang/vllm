@@ -67,6 +67,7 @@ KVCache = Tuple[torch.Tensor, torch.Tensor]
 LORA_DIR = os.environ.get("MIXTRAL_LORA_DIR", None)
 LORA_FROM_EXPERT = os.environ.get("MIXTRAL_LORA_FROM_EXPERT", None)
 LORA_TO_EXPERTS_PER_LAYER = os.environ.get("MIXTRAL_LORA_TO_EXPERTS_PER_LAYER", None)
+LORA_MAX_LAYERS = os.environ.get("MIXTRAL_LORA_MAX_LAYERS", 32)
 if LORA_FROM_EXPERT is not None:
     LORA_FROM_EXPERT = int(LORA_FROM_EXPERT)
 if LORA_TO_EXPERTS_PER_LAYER is not None:
@@ -262,7 +263,7 @@ class MixtralMoE(nn.Module):
                                                        dim=-1)
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
-        if LORA_DIR is not None:
+        if LORA_DIR is not None and self.layer_idx < LORA_MAX_LAYERS:
             # route FROM_EXPERT to TO_EXPERT instead
             selected_experts[selected_experts == LORA_FROM_EXPERT] = LORA_TO_EXPERTS_PER_LAYER[self.layer_idx]
 
@@ -555,6 +556,8 @@ class MixtralModel(nn.Module):
             return
         assert len(LORA_TO_EXPERTS_PER_LAYER) == len(self.layers)
         for layer_idx, layer in enumerate(self.layers):
+            if layer_idx >= LORA_MAX_LAYERS:
+                continue
             expert_indices = layer.block_sparse_moe.expert_indicies
             for expert_idx in expert_indices:
                 expert_layer = layer.block_sparse_moe.experts[expert_idx]

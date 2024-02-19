@@ -72,6 +72,8 @@ if LORA_FROM_EXPERT is not None:
     LORA_FROM_EXPERT = int(LORA_FROM_EXPERT)
 if LORA_TO_EXPERTS_PER_LAYER is not None:
     LORA_TO_EXPERTS_PER_LAYER = [int(x) for x in LORA_TO_EXPERTS_PER_LAYER.split(",")]
+if LORA_MAX_LAYERS is not None:
+    LORA_MAX_LAYERS = int(LORA_MAX_LAYERS)
 
 class MixtralParallelism:
     DATA_EXPERT_PARALLEL = "data_expert_parallel"

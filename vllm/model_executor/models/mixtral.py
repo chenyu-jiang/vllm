@@ -266,8 +266,8 @@ class MixtralMoE(nn.Module):
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
         if LORA_DIR is not None and self.layer_idx < LORA_MAX_LAYERS:
-            # route FROM_EXPERT to TO_EXPERT instead
-            selected_experts[selected_experts == LORA_FROM_EXPERT] = LORA_TO_EXPERTS_PER_LAYER[self.layer_idx]
+            # route TO_EXPERT to FROM_EXPERT instead
+            selected_experts[selected_experts == LORA_TO_EXPERTS_PER_LAYER[self.layer_idx]] = LORA_FROM_EXPERT
 
         if self.parallel_method == MixtralParallelism.TENSOR_EXPERT_PARALLEL:
             final_hidden_states = None

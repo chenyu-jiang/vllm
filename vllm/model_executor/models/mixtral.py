@@ -64,6 +64,7 @@ from vllm.sequence import SamplerOutput
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
+NO_LORA = os.environ.get("MIXTRAL_NO_LORA", None)
 LORA_DIR = os.environ.get("MIXTRAL_LORA_DIR", None)
 LORA_FROM_EXPERT = os.environ.get("MIXTRAL_LORA_FROM_EXPERT", None)
 LORA_TO_EXPERTS_PER_LAYER = os.environ.get("MIXTRAL_LORA_TO_EXPERTS_PER_LAYER", None)
@@ -130,18 +131,25 @@ class MixtralMLP(nn.Module):
         self.lora_w1 = None
         self.lora_w2 = None
         self.lora_w3 = None
+        self.lora_activated = False
+
+    def activate_lora(self):
+        self.lora_activated = True
+
+    def deactivate_lora(self):
+        self.lora_activated = False
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         w1_out, _ = self.w1(hidden_states)
-        if self.lora_w1 is not None:
+        if self.lora_w1 is not None and self.lora_activated:
             w1_out += self.lora_w1(hidden_states)
         w1_out = self.act_fn(w1_out)
         w3_out, _ = self.w3(hidden_states)
-        if self.lora_w3 is not None:
+        if self.lora_w3 is not None and self.lora_activated:
             w3_out += self.lora_w3(hidden_states)
         current_hidden_states = w1_out * w3_out
         output_hidden_states, _ = self.w2(current_hidden_states)
-        if self.lora_w2 is not None:
+        if self.lora_w2 is not None and self.lora_activated:
             output_hidden_states += self.lora_w2(current_hidden_states)
         return output_hidden_states
 
@@ -265,13 +273,34 @@ class MixtralMoE(nn.Module):
                                                        dim=-1)
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
-        if LORA_DIR is not None and self.layer_idx < LORA_MAX_LAYERS:
-            # route TO_EXPERT to FROM_EXPERT instead
-            selected_experts[selected_experts == LORA_TO_EXPERTS_PER_LAYER[self.layer_idx]] = LORA_FROM_EXPERT
+        # if LORA_DIR is not None and self.layer_idx < LORA_MAX_LAYERS:
+        #     # route TO_EXPERT to FROM_EXPERT instead
+        #     selected_experts[selected_experts == LORA_TO_EXPERTS_PER_LAYER[self.layer_idx]] = LORA_FROM_EXPERT
+        #     # selected_experts[selected_experts == LORA_FROM_EXPERT] = LORA_TO_EXPERTS_PER_LAYER[self.layer_idx]
 
         if self.parallel_method == MixtralParallelism.TENSOR_EXPERT_PARALLEL:
             final_hidden_states = None
             for expert_idx in self.expert_indicies:
+                if LORA_DIR is not None and self.layer_idx < LORA_MAX_LAYERS:
+                    if expert_idx == LORA_TO_EXPERTS_PER_LAYER[self.layer_idx]:
+                        # this should be routed to LORA_FROM_EXPERT, with lora activated
+                        # so we skip
+                        continue
+                    elif expert_idx == LORA_FROM_EXPERT:
+                        # we need to run an additional forward for the expert with lora activated
+                        expert_layer = self.experts[expert_idx]
+                        expert_mask = (selected_experts == LORA_TO_EXPERTS_PER_LAYER[self.layer_idx])
+                        expert_weights = (routing_weights * expert_mask).sum(dim=-1,
+                                                                            keepdim=True)
+                        expert_layer.activate_lora()
+                        current_hidden_states = expert_layer(hidden_states).mul_(
+                            expert_weights)
+                        expert_layer.deactivate_lora()
+                        if final_hidden_states is None:
+                            final_hidden_states = current_hidden_states
+                        else:
+                            final_hidden_states.add_(current_hidden_states)
+
                 expert_layer = self.experts[expert_idx]
                 expert_mask = (selected_experts == expert_idx)
                 expert_weights = (routing_weights * expert_mask).sum(dim=-1,
@@ -279,11 +308,14 @@ class MixtralMoE(nn.Module):
 
                 current_hidden_states = expert_layer(hidden_states).mul_(
                     expert_weights)
+                expert_layer.deactivate_lora()
                 if final_hidden_states is None:
                     final_hidden_states = current_hidden_states
                 else:
                     final_hidden_states.add_(current_hidden_states)
-
+            if final_hidden_states is None:
+                # No experts were assigned to this rank, so we return zeros.
+                final_hidden_states = torch.zeros_like(hidden_states)
             return tensor_model_parallel_all_reduce(final_hidden_states).view(
                 batch_size, sequence_length, hidden_dim)
         else:
@@ -554,6 +586,8 @@ class MixtralModel(nn.Module):
         return hidden_states
 
     def load_lora_weight(self):
+        if NO_LORA is not None:
+            return
         if LORA_DIR is None:
             return
         assert len(LORA_TO_EXPERTS_PER_LAYER) == len(self.layers)

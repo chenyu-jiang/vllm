@@ -25,30 +25,26 @@ def fix_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-class DecomposedLinear(torch.nn.Module):
+class FFN(torch.nn.Module):
     def __init__(self, in_dim: int, out_dim: int, r: int):
-        super(DecomposedLinear, self).__init__()
-        self.fc1 = torch.nn.Linear(in_dim, r, bias=False)
-        self.fc2 = torch.nn.Linear(r, out_dim, bias=False)
+        super(FFN, self).__init__()
+        self.fc1 = torch.nn.Linear(in_dim, r)
+        self.fc2 = torch.nn.Linear(r, out_dim)
+        self.act = torch.nn.SiLU()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.fc1(hidden_states)
+        hidden_states = self.act(hidden_states)
         hidden_states = self.fc2(hidden_states)
         return hidden_states
 
-class LowRankApprox(torch.nn.Module):
+class NNApprox(torch.nn.Module):
     def __init__(self, in_dim: int, out_dim: int, k: int, r: int):
-        super(LowRankApprox, self).__init__()
+        super(NNApprox, self).__init__()
         self.k = k
         for i in range(k + 1):
             setattr(self, f"wk_{i}", torch.nn.Linear(in_dim, out_dim, bias=False))
-        self.wks = [getattr(self, f"wk_{i}") for i in range(k + 1)]
-        for i in range(k + 1):
-            if i == 0:
-                setattr(self, f"wk_adapter_{i}", torch.nn.Identity())
-            else:
-                setattr(self, f"wk_adapter_{i}", DecomposedLinear(out_dim, out_dim, r))
-        self.wk_adapters = [getattr(self, f"wk_adapter_{i}") for i in range(k + 1)]
+        self.out_nn = FFN(out_dim * k, out_dim, r)
         self.freeze_weights()
 
     def freeze_weights(self):
@@ -59,11 +55,11 @@ class LowRankApprox(torch.nn.Module):
         wk_outs = []
         for i in range(self.k + 1):
             wk = getattr(self, f"wk_{i}")
-            adapter = getattr(self, f"wk_adapter_{i}")
             wk_out = wk(hidden_states)
-            wk_out = adapter(wk_out)
             wk_outs.append(wk_out)
-        diff = wk_outs[0] - sum(wk_outs[1:])
+        concated_nn_outs = torch.cat(wk_outs[1:], dim=1)
+        projected_outs = self.out_nn(concated_nn_outs)
+        diff = wk_outs[0] - projected_outs
         return torch.linalg.vector_norm(diff, ord=2, dim=1), torch.mean(torch.abs(diff), dim=1)
 
     @classmethod
@@ -84,7 +80,7 @@ class LowRankApprox(torch.nn.Module):
         return {k: v for k, v in state_dict.items() if "adapter" in k}
 
 def create_model(args, weights, r):
-    model = LowRankApprox.from_weights(weights, r, args.dtype)
+    model = NNApprox.from_weights(weights, r, args.dtype)
     model = model.to(args.device)
     return model
 
@@ -102,9 +98,15 @@ def evaluate(model: torch.nn.Module, eval_loader):
     return avg_loss / len(eval_loader), avg_diff / len(eval_loader)
 
 def get_output_subdir(args):
-    return f"w{args.weight_id}_e{args.expert_id}_l{args.layer_id}_r{args.r}"
+    if len(args.target_expert_ids) == 7:
+        expert_id_str = "all"
+    elif len(args.target_expert_ids) == 0:
+        expert_id_str = "rnd"
+    else:
+        expert_id_str = ",".join(map(str, args.target_expert_ids))
+    return f"w{args.weight_id}_e{args.expert_id}_l{args.layer_id}_r{args.r}_e{expert_id_str}" + ("" if args.dtype == "bfloat16" else f"_{args.dtype}")
 
-def train(args, model: LowRankApprox, train_loader, eval_loader, optimizer: torch.optim.Optimizer, lr_scheduler=None, save=True):
+def train(args, model: NNApprox, train_loader, eval_loader, optimizer: torch.optim.Optimizer, lr_scheduler=None, save=True):
     model.train()
     avg_loss = 0
     avg_diff = 0
@@ -177,7 +179,11 @@ def main_func(args, save=True):
                 if w_name in name:
                     exper_id_to_params[expert_id][w_name] = param
     target_weight = exper_id_to_params[args.expert_id][f"w{args.weight_id}"]
-    other_weights = [exper_id_to_params[other_expert_id][f"w{args.weight_id}"] for other_expert_id in range(8) if other_expert_id != args.expert_id]
+    if not args.target_expert_ids:
+        # use random weight
+        other_weights = [torch.randn_like(target_weight)]
+    else:
+        other_weights = [exper_id_to_params[other_expert_id][f"w{args.weight_id}"] for other_expert_id in args.target_expert_ids]
     # load data
     train_loader, eval_loader = create_dataloaders(args)
     # create model
@@ -201,17 +207,25 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=20)
     parser.add_argument("--train_split", type=float, default=0.9)
     parser.add_argument("--expert_id", type=int, default=0)
+    parser.add_argument("--target_expert_ids", type=str, default="all")
     parser.add_argument("--weight_id", type=int, default=1)
     parser.add_argument("--layer_id", type=int, default=0)
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     args = parser.parse_args()
 
+    assert args.weight_id == 1 or args.weight_id == 3, "Weight ID must be in {1, 3}"
     assert args.expert_id < 8 and args.expert_id >= 0, "Expert ID must be in [0, 7]"
-    assert args.weight_id in [1, 2, 3], "Weight ID must be in [1, 2, 3]"
+
+    if args.target_expert_ids == "all":
+        args.target_expert_ids = sorted(list(set(range(8)) - {args.expert_id}))
+    elif args.target_expert_ids == "rnd":
+        args.target_expert_ids = []
+    else:
+        args.target_expert_ids = list(map(int, args.target_expert_ids.split(",")))
 
     fix_seed(42)
-    wandb.init(project="multi-lowrank-all-others", dir=args.output_dir, config=args, name=get_output_subdir(args))
+    wandb.init(project="multi-lowrank-all-others-nn", dir=args.output_dir, config=args, name=get_output_subdir(args))
     main_func(args)
     wandb.finish()
 

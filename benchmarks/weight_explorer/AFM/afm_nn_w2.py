@@ -25,56 +25,74 @@ def fix_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-class DecomposedLinear(torch.nn.Module):
+class FFN(torch.nn.Module):
     def __init__(self, in_dim: int, out_dim: int, r: int):
-        super(DecomposedLinear, self).__init__()
-        self.fc1 = torch.nn.Linear(in_dim, r, bias=False)
-        self.fc2 = torch.nn.Linear(r, out_dim, bias=False)
+        super(FFN, self).__init__()
+        self.fc1 = torch.nn.Linear(in_dim, r)
+        self.fc2 = torch.nn.Linear(r, out_dim)
+        self.act = torch.nn.SiLU()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.fc1(hidden_states)
+        hidden_states = self.act(hidden_states)
         hidden_states = self.fc2(hidden_states)
         return hidden_states
 
-class LowRankApprox(torch.nn.Module):
+class NNApprox(torch.nn.Module):
     def __init__(self, in_dim: int, out_dim: int, k: int, r: int):
-        super(LowRankApprox, self).__init__()
+        super(NNApprox, self).__init__()
         self.k = k
         for i in range(k + 1):
-            setattr(self, f"wk_{i}", torch.nn.Linear(in_dim, out_dim, bias=False))
-        self.wks = [getattr(self, f"wk_{i}") for i in range(k + 1)]
-        for i in range(k + 1):
-            if i == 0:
-                setattr(self, f"wk_adapter_{i}", torch.nn.Identity())
-            else:
-                setattr(self, f"wk_adapter_{i}", DecomposedLinear(out_dim, out_dim, r))
-        self.wk_adapters = [getattr(self, f"wk_adapter_{i}") for i in range(k + 1)]
+            setattr(self, f"wk_1_{i}", torch.nn.Linear(in_dim, out_dim, bias=False))
+            setattr(self, f"wk_3_{i}", torch.nn.Linear(in_dim, out_dim, bias=False))
+            setattr(self, f"wk_2_{i}", torch.nn.Linear(out_dim, in_dim, bias=False))
+        self.out_nn = FFN(in_dim * k, in_dim, r)
+        self.act = torch.nn.SiLU()
         self.freeze_weights()
 
     def freeze_weights(self):
         for i in range(self.k + 1):
-            getattr(self, f"wk_{i}").requires_grad_(False)
+            getattr(self, f"wk_1_{i}").requires_grad_(False)
+            getattr(self, f"wk_3_{i}").requires_grad_(False)
+            getattr(self, f"wk_2_{i}").requires_grad_(False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         wk_outs = []
         for i in range(self.k + 1):
-            wk = getattr(self, f"wk_{i}")
-            adapter = getattr(self, f"wk_adapter_{i}")
-            wk_out = wk(hidden_states)
-            wk_out = adapter(wk_out)
+            wk_1 = getattr(self, f"wk_1_{i}")
+            wk_2 = getattr(self, f"wk_2_{i}")
+            wk_3 = getattr(self, f"wk_3_{i}")
+            wk_1_out = wk_1(hidden_states)
+            wk_1_out = self.act(wk_1_out)
+            wk_3_out = wk_3(hidden_states)
+            wk_out = wk_1_out * wk_3_out
+            wk_out = wk_2(wk_out)
             wk_outs.append(wk_out)
-        diff = wk_outs[0] - sum(wk_outs[1:])
+        concated_nn_outs = torch.cat(wk_outs[1:], dim=1)
+        projected_outs = self.out_nn(concated_nn_outs)
+        diff = wk_outs[0] - projected_outs
         return torch.linalg.vector_norm(diff, ord=2, dim=1), torch.mean(torch.abs(diff), dim=1)
 
     @classmethod
-    def from_weights(cls, wks: List[torch.Tensor], r: int, dtype):
-        assert len(wks) > 1
-        in_dim = wks[0].shape[1]
-        out_dim = wks[0].shape[0]
-        model = cls(in_dim, out_dim, len(wks) - 1, r)
+    def from_weights(cls, wks_1: List[torch.Tensor],
+                     wks_3: List[torch.Tensor],
+                     wks_2: List[torch.Tensor],
+                     r: int, dtype):
+        assert len(wks_1) > 1
+        assert len(wks_3) > 1
+        assert len(wks_2) > 1
+        in_dim = wks_1[0].shape[1]
+        out_dim = wks_1[0].shape[0]
+        model = cls(in_dim, out_dim, len(wks_1) - 1, r)
         model = model.to(_to_torch_dtype(dtype))
-        for i, w in enumerate(wks):
-            wk_module = getattr(model, f"wk_{i}")
+        for i, w in enumerate(wks_1):
+            wk_module = getattr(model, f"wk_1_{i}")
+            wk_module.weight.data.copy_(w)
+        for i, w in enumerate(wks_3):
+            wk_module = getattr(model, f"wk_3_{i}")
+            wk_module.weight.data.copy_(w)
+        for i, w in enumerate(wks_2):
+            wk_module = getattr(model, f"wk_2_{i}")
             wk_module.weight.data.copy_(w)
         model.freeze_weights()
         return model
@@ -83,8 +101,8 @@ class LowRankApprox(torch.nn.Module):
         state_dict = self.state_dict()
         return {k: v for k, v in state_dict.items() if "adapter" in k}
 
-def create_model(args, weights, r):
-    model = LowRankApprox.from_weights(weights, r, args.dtype)
+def create_model(args, weights_1, weights_3, weights_2, r):
+    model = NNApprox.from_weights(weights_1, weights_3, weights_2, r, args.dtype)
     model = model.to(args.device)
     return model
 
@@ -102,9 +120,15 @@ def evaluate(model: torch.nn.Module, eval_loader):
     return avg_loss / len(eval_loader), avg_diff / len(eval_loader)
 
 def get_output_subdir(args):
-    return f"w{args.weight_id}_e{args.expert_id}_l{args.layer_id}_r{args.r}"
+    if len(args.target_expert_ids) == 7:
+        expert_id_str = "all"
+    elif len(args.target_expert_ids) == 0:
+        expert_id_str = "rnd"
+    else:
+        expert_id_str = ",".join(map(str, args.target_expert_ids))
+    return f"w{args.weight_id}_e{args.expert_id}_l{args.layer_id}_r{args.r}_e{expert_id_str}" + ("" if args.dtype == "bfloat16" else f"_{args.dtype}")
 
-def train(args, model: LowRankApprox, train_loader, eval_loader, optimizer: torch.optim.Optimizer, lr_scheduler=None, save=True):
+def train(args, model: NNApprox, train_loader, eval_loader, optimizer: torch.optim.Optimizer, lr_scheduler=None, save=True):
     model.train()
     avg_loss = 0
     avg_diff = 0
@@ -176,12 +200,22 @@ def main_func(args, save=True):
             for w_name in ["w1", "w2", "w3"]:
                 if w_name in name:
                     exper_id_to_params[expert_id][w_name] = param
-    target_weight = exper_id_to_params[args.expert_id][f"w{args.weight_id}"]
-    other_weights = [exper_id_to_params[other_expert_id][f"w{args.weight_id}"] for other_expert_id in range(8) if other_expert_id != args.expert_id]
+    target_weight_1 = exper_id_to_params[args.expert_id][f"w1"]
+    target_weight_3 = exper_id_to_params[args.expert_id][f"w3"]
+    target_weight_2 = exper_id_to_params[args.expert_id][f"w2"]
+    if not args.target_expert_ids:
+        assert False, "Not implemented"
+    else:
+        other_weights_1 = [exper_id_to_params[other_expert_id][f"w1"] for other_expert_id in args.target_expert_ids]
+        other_weights_3 = [exper_id_to_params[other_expert_id][f"w3"] for other_expert_id in args.target_expert_ids]
+        other_weights_2 = [exper_id_to_params[other_expert_id][f"w2"] for other_expert_id in args.target_expert_ids]
     # load data
     train_loader, eval_loader = create_dataloaders(args)
     # create model
-    model = create_model(args, [target_weight] + other_weights, args.r)
+    model = create_model(args, [target_weight_1] + other_weights_1,
+                            [target_weight_3] + other_weights_3,
+                            [target_weight_2] + other_weights_2,
+                          args.r)
     # create optimizer
     optimizer = torch.optim.Adam([t for t in model.parameters() if t.requires_grad], lr=1e-3)
     # lr scheduler
@@ -201,17 +235,25 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=20)
     parser.add_argument("--train_split", type=float, default=0.9)
     parser.add_argument("--expert_id", type=int, default=0)
-    parser.add_argument("--weight_id", type=int, default=1)
+    parser.add_argument("--target_expert_ids", type=str, default="all")
+    parser.add_argument("--weight_id", type=int, default=2)
     parser.add_argument("--layer_id", type=int, default=0)
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     args = parser.parse_args()
 
     assert args.expert_id < 8 and args.expert_id >= 0, "Expert ID must be in [0, 7]"
-    assert args.weight_id in [1, 2, 3], "Weight ID must be in [1, 2, 3]"
+    assert args.weight_id == 2, "Weight ID must be in [2]"
+
+    if args.target_expert_ids == "all":
+        args.target_expert_ids = sorted(list(set(range(8)) - {args.expert_id}))
+    elif args.target_expert_ids == "rnd":
+        args.target_expert_ids = []
+    else:
+        args.target_expert_ids = list(map(int, args.target_expert_ids.split(",")))
 
     fix_seed(42)
-    wandb.init(project="multi-lowrank-all-others", dir=args.output_dir, config=args, name=get_output_subdir(args))
+    wandb.init(project="multi-lowrank-all-others-nn", dir=args.output_dir, config=args, name=get_output_subdir(args))
     main_func(args)
     wandb.finish()
 

@@ -64,39 +64,35 @@ from vllm.sequence import SamplerOutput
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
-NO_LORA = os.environ.get("MIXTRAL_NO_LORA", None)
-LORA_DIR = os.environ.get("MIXTRAL_LORA_DIR", None)
-LORA_FROM_EXPERT = os.environ.get("MIXTRAL_LORA_FROM_EXPERT", None)
-LORA_TO_EXPERTS_PER_LAYER = os.environ.get("MIXTRAL_LORA_TO_EXPERTS_PER_LAYER", None)
-LORA_MAX_LAYERS = os.environ.get("MIXTRAL_LORA_MAX_LAYERS", 32)
-if LORA_FROM_EXPERT is not None:
-    LORA_FROM_EXPERT = int(LORA_FROM_EXPERT)
-if LORA_TO_EXPERTS_PER_LAYER is not None:
-    LORA_TO_EXPERTS_PER_LAYER = [int(x) for x in LORA_TO_EXPERTS_PER_LAYER.split(",")]
-if LORA_MAX_LAYERS is not None:
-    LORA_MAX_LAYERS = int(LORA_MAX_LAYERS)
+NO_MLP = os.environ.get("MIXTRAL_NO_MLP", None)
+MLP_DIR = os.environ.get("MIXTRAL_MLP_DIR", None)
+MLP_ROUTE_FROM_EXPERT = os.environ.get("MIXTRAL_MLP_ROUTE_FROM_EXPERT", None)
+MLP_ROUTE_TO_EXPERTS_PER_LAYER = os.environ.get("MIXTRAL_MLP_ROUTE_TO_EXPERTS_PER_LAYER", None)
+MLP_MAX_LAYERS = os.environ.get("MIXTRAL_MLP_MAX_LAYERS", 32)
+if MLP_ROUTE_FROM_EXPERT is not None:
+    MLP_ROUTE_FROM_EXPERT = int(MLP_ROUTE_FROM_EXPERT)
+if MLP_ROUTE_TO_EXPERTS_PER_LAYER is not None:
+    MLP_ROUTE_TO_EXPERTS_PER_LAYER = [int(x) for x in MLP_ROUTE_TO_EXPERTS_PER_LAYER.split(",")]
+if MLP_MAX_LAYERS is not None:
+    MLP_MAX_LAYERS = int(MLP_MAX_LAYERS)
 
 class MixtralParallelism:
     DATA_EXPERT_PARALLEL = "data_expert_parallel"
     TENSOR_EXPERT_PARALLEL = "tensor_expert_parallel"
 
 
-class LoRALinear(nn.Module):
-    def __init__(self, in_features, out_features, r, lora_alpha, dtype):
-        super(LoRALinear, self).__init__()
-        self.lora_A = nn.Linear(in_features, r, bias=False, dtype=dtype)
-        self.lora_B = nn.Linear(r, out_features, bias=False, dtype=dtype)
-        self.scale = lora_alpha
-        self.dtype = dtype
+class MLP(nn.Module):
+    def __init__(self, in_dim, out_dim, r):
+        super(MLP, self).__init__()
+        self.fc1 = nn.Linear(in_dim, r)
+        self.fc2 = nn.Linear(r, out_dim)
+        self.act = nn.SiLU()
 
-    def forward(self, x):
-        return self.lora_B(self.lora_A(x)) * self.scale
-
-    def load_lora_weight(self, state_dict):
-        self.lora_A.weight.data.copy_(state_dict['lora_A.weight'])
-        self.lora_B.weight.data.copy_(state_dict['lora_B.weight'])
-        self.lora_A.cuda()
-        self.lora_B.cuda()
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.fc2(hidden_states)
+        return hidden_states
 
 
 class MixtralMLP(nn.Module):
@@ -128,45 +124,50 @@ class MixtralMLP(nn.Module):
 
         # TODO: Use vllm's SiluAndMul
         self.act_fn = nn.SiLU()
-        self.lora_w1 = None
-        self.lora_w2 = None
-        self.lora_w3 = None
-        self.lora_activated = False
+        self.w1_mlp = None
+        self.w2_mlp = None
+        self.w3_mlp = None
+        self.mlp_activated = False
 
-    def activate_lora(self):
-        self.lora_activated = True
+    def activate_mlp(self):
+        self.mlp_activated = True
 
-    def deactivate_lora(self):
-        self.lora_activated = False
+    def deactivate_mlp(self):
+        self.mlp_activated = False
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         w1_out, _ = self.w1(hidden_states)
-        if self.lora_w1 is not None and self.lora_activated:
-            w1_out += self.lora_w1(hidden_states)
+        if self.w1_mlp is not None and self.mlp_activated:
+            w1_out = self.w1_mlp(w1_out)
         w1_out = self.act_fn(w1_out)
         w3_out, _ = self.w3(hidden_states)
-        if self.lora_w3 is not None and self.lora_activated:
-            w3_out += self.lora_w3(hidden_states)
+        if self.w3_mlp is not None and self.mlp_activated:
+            w3_out = self.w3_mlp(w3_out)
         current_hidden_states = w1_out * w3_out
         output_hidden_states, _ = self.w2(current_hidden_states)
-        if self.lora_w2 is not None and self.lora_activated:
-            output_hidden_states += self.lora_w2(current_hidden_states)
+        if self.w2_mlp is not None and self.mlp_activated:
+            output_hidden_states = self.w2_mlp(output_hidden_states)
         return output_hidden_states
 
-    def init_lora(self, state_dict, lora_alpha=None):
-        for w_name in ["w1", "w2", "w3"]:
-            w_A = state_dict[f"{w_name}.lora_A.weight"]
-            w_B = state_dict[f"{w_name}.lora_B.weight"]
-            r = w_A.shape[0]
-            in_features = w_A.shape[1]
-            out_features = w_B.shape[0]
-            lora_alpha = lora_alpha if lora_alpha is not None else r
-            setattr(self, f"lora_{w_name}", LoRALinear(in_features, out_features, r, lora_alpha, w_A.dtype))
-            getattr(self, f"lora_{w_name}").load_lora_weight({
-                "lora_A.weight": w_A,
-                "lora_B.weight": w_B
-            })
+    def init_mlp(self, state_dict):
+        for w_name in range(1, 4):
+            weight_state_dict = state_dict[f"w{w_name}"]
+            fc1_weight = weight_state_dict[f"out_nn.fc1.weight"]
+            fc1_bias = weight_state_dict[f"out_nn.fc1.bias"]
+            fc2_weight = weight_state_dict[f"out_nn.fc2.weight"]
+            fc2_bias = weight_state_dict[f"out_nn.fc2.bias"]
 
+            r = fc1_weight.shape[0]
+            in_features = fc1_weight.shape[1]
+            out_features = fc2_weight.shape[0]
+            mlp = MLP(in_features, out_features, r)
+            mlp.to(fc1_weight.dtype)
+            mlp.fc1.weight.data.copy_(fc1_weight)
+            mlp.fc1.bias.data.copy_(fc1_bias)
+            mlp.fc2.weight.data.copy_(fc2_weight)
+            mlp.fc2.bias.data.copy_(fc2_bias)
+            mlp.cuda()
+            setattr(self, f"w{w_name}_mlp", mlp)
 
 class MixtralTensorParallelMLP(nn.Module):
 
@@ -273,51 +274,51 @@ class MixtralMoE(nn.Module):
                                                        dim=-1)
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
-        # if LORA_DIR is not None and self.layer_idx < LORA_MAX_LAYERS:
-        #     # route TO_EXPERT to FROM_EXPERT instead
-        #     selected_experts[selected_experts == LORA_TO_EXPERTS_PER_LAYER[self.layer_idx]] = LORA_FROM_EXPERT
-        #     # selected_experts[selected_experts == LORA_FROM_EXPERT] = LORA_TO_EXPERTS_PER_LAYER[self.layer_idx]
 
         if self.parallel_method == MixtralParallelism.TENSOR_EXPERT_PARALLEL:
-            final_hidden_states = None
-            for expert_idx in self.expert_indicies:
-                if LORA_DIR is not None and self.layer_idx < LORA_MAX_LAYERS:
-                    if expert_idx == LORA_TO_EXPERTS_PER_LAYER[self.layer_idx]:
-                        # this should be routed to LORA_FROM_EXPERT, with lora activated
-                        # so we skip
-                        continue
-                    elif expert_idx == LORA_FROM_EXPERT:
-                        # we need to run an additional forward for the expert with lora activated
-                        expert_layer = self.experts[expert_idx]
-                        expert_mask = (selected_experts == LORA_TO_EXPERTS_PER_LAYER[self.layer_idx])
-                        expert_weights = (routing_weights * expert_mask).sum(dim=-1,
-                                                                            keepdim=True)
-                        expert_layer.activate_lora()
-                        current_hidden_states = expert_layer(hidden_states).mul_(
-                            expert_weights)
-                        expert_layer.deactivate_lora()
-                        if final_hidden_states is None:
-                            final_hidden_states = current_hidden_states
-                        else:
-                            final_hidden_states.add_(current_hidden_states)
+            try:
+                final_hidden_states = None
+                for expert_idx in self.expert_indicies:
+                    if MLP_DIR is not None and self.layer_idx < MLP_MAX_LAYERS:
+                        if expert_idx == MLP_ROUTE_FROM_EXPERT:
+                            # this should be routed to MLP_ROUTE_TO_EXPERTS_PER_LAYER, with mlp activated
+                            # so we skip
+                            continue
+                        elif expert_idx == MLP_ROUTE_TO_EXPERTS_PER_LAYER[self.layer_idx]:
+                            # we need to run an additional forward for the expert with mlp activated
+                            expert_layer = self.experts[expert_idx]
+                            expert_mask = (selected_experts == MLP_ROUTE_FROM_EXPERT)
+                            expert_weights = (routing_weights * expert_mask).sum(dim=-1,
+                                                                                keepdim=True)
+                            if not NO_MLP:
+                                expert_layer.activate_mlp()
+                            current_hidden_states = expert_layer(hidden_states).mul_(
+                                expert_weights)
+                            expert_layer.deactivate_mlp()
+                            if final_hidden_states is None:
+                                final_hidden_states = current_hidden_states
+                            else:
+                                final_hidden_states.add_(current_hidden_states)
 
-                expert_layer = self.experts[expert_idx]
-                expert_mask = (selected_experts == expert_idx)
-                expert_weights = (routing_weights * expert_mask).sum(dim=-1,
-                                                                    keepdim=True)
+                    expert_layer = self.experts[expert_idx]
+                    expert_mask = (selected_experts == expert_idx)
+                    expert_weights = (routing_weights * expert_mask).sum(dim=-1,
+                                                                        keepdim=True)
 
-                current_hidden_states = expert_layer(hidden_states).mul_(
-                    expert_weights)
-                expert_layer.deactivate_lora()
+                    current_hidden_states = expert_layer(hidden_states).mul_(
+                        expert_weights)
+                    if final_hidden_states is None:
+                        final_hidden_states = current_hidden_states
+                    else:
+                        final_hidden_states.add_(current_hidden_states)
                 if final_hidden_states is None:
-                    final_hidden_states = current_hidden_states
-                else:
-                    final_hidden_states.add_(current_hidden_states)
-            if final_hidden_states is None:
-                # No experts were assigned to this rank, so we return zeros.
-                final_hidden_states = torch.zeros_like(hidden_states)
-            return tensor_model_parallel_all_reduce(final_hidden_states).view(
-                batch_size, sequence_length, hidden_dim)
+                    # No experts were assigned to this rank, so we return zeros.
+                    final_hidden_states = torch.zeros_like(hidden_states)
+                return tensor_model_parallel_all_reduce(final_hidden_states).view(
+                    batch_size, sequence_length, hidden_dim)
+            except Exception as e:
+                print("Error in MixtralMoE forward", e, flush=True)
+                raise e
         else:
             # dispatch
             n_tokens = hidden_states.shape[0]
@@ -585,23 +586,28 @@ class MixtralModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def load_lora_weight(self):
-        if NO_LORA is not None:
+    def load_mlp_weight(self):
+        if MLP_DIR is None:
             return
-        if LORA_DIR is None:
-            return
-        assert len(LORA_TO_EXPERTS_PER_LAYER) == len(self.layers)
-        for layer_idx, layer in enumerate(self.layers):
-            if layer_idx >= LORA_MAX_LAYERS:
-                continue
-            expert_indices = layer.block_sparse_moe.expert_indicies
-            for expert_idx in expert_indices:
-                expert_layer = layer.block_sparse_moe.experts[expert_idx]
-                if LORA_TO_EXPERTS_PER_LAYER[layer_idx] == expert_idx:
-                    lora_to_expert = LORA_TO_EXPERTS_PER_LAYER[layer_idx]
-                    print("Loading LoRA weight for expert", expert_idx, "from expert", LORA_FROM_EXPERT)
-                    state_dict = torch.load(os.path.join(LORA_DIR, f"from{LORA_FROM_EXPERT}_to{lora_to_expert}_l{layer_idx}_r128", "lora_model.pt"))
-                    expert_layer.init_lora(state_dict, lora_alpha=128)
+        assert len(MLP_ROUTE_TO_EXPERTS_PER_LAYER) == len(self.layers)
+        try:
+            for layer_idx, layer in enumerate(self.layers):
+                if layer_idx >= MLP_MAX_LAYERS:
+                    continue
+                expert_indices = layer.block_sparse_moe.expert_indicies
+                for expert_idx in expert_indices:
+                    expert_layer = layer.block_sparse_moe.experts[expert_idx]
+                    if MLP_ROUTE_TO_EXPERTS_PER_LAYER[layer_idx] == expert_idx:
+                        route_to_expert = MLP_ROUTE_TO_EXPERTS_PER_LAYER[layer_idx]
+                        print("Loading MLP weight for expert", expert_idx, "from expert", MLP_ROUTE_FROM_EXPERT)
+                        state_dicts = {}
+                        for w_name in range(1, 4):
+                            inner_state_dict = torch.load(os.path.join(MLP_DIR, f"w{w_name}_e{MLP_ROUTE_FROM_EXPERT}_l{layer_idx}_r512_e{route_to_expert}", f"model.pt"))
+                            state_dicts[f"w{w_name}"] = inner_state_dict
+                        expert_layer.init_mlp(state_dicts)
+        except Exception as e:
+            print("Error in loading MLP weight", e, flush=True)
+            raise e
 
 class MixtralForCausalLM(nn.Module):
 
@@ -693,4 +699,4 @@ class MixtralForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
-        self.model.load_lora_weight()
+        self.model.load_mlp_weight()

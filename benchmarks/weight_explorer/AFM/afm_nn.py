@@ -77,7 +77,7 @@ class NNApprox(torch.nn.Module):
 
     def get_adapter_states(self):
         state_dict = self.state_dict()
-        return {k: v for k, v in state_dict.items() if "adapter" in k}
+        return {k: v for k, v in state_dict.items() if "out_nn" in k}
 
 def create_model(args, weights, r):
     model = NNApprox.from_weights(weights, r, args.dtype)

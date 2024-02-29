@@ -188,5 +188,6 @@ benchmarks/plot_*
 benchmarks/**/*.pdf
 benchmarks/**/*_dataset/*
 benchmarks/**/*.txt
+benchmarks/**/*.sh
 **/wandb/*
 **/*.pt

@@ -71,19 +71,19 @@ def main_func(args, save=True):
             for w_name in ["w1", "w2", "w3"]:
                 if w_name in name:
                     exper_id_to_params[expert_id][w_name] = param
-    w1_weights = []
-    w3_weights = []
     weights = []
     for expert_id in range(8):
         weights.append(exper_id_to_params[expert_id][f"w2"].to(args.device))
-        w1_weights.append(exper_id_to_params[expert_id][f"w1"].to(args.device))
-        w3_weights.append(exper_id_to_params[expert_id][f"w3"].to(args.device))
+    # load trained w1 and w3 weight
+    for expert_id in range(8):
+        w1_weight = torch.load(os.path.join(args.output_dir, f"w1_l{args.layer_id}", f"target_model.pt"))['weight']
+        w3_weight = torch.load(os.path.join(args.output_dir, f"w3_l{args.layer_id}", f"target_model.pt"))['weight']
     # load data
     data = create_dataloaders(args)
     # project data using w1 and w3
     xs = []
-    for (x, w1, w3) in zip(data, w1_weights, w3_weights):
-        y = torch.nn.functional.silu(x @ w1.t()) * (x @ w3.t())
+    for x in data:
+        y = torch.nn.functional.silu(x @ w1_weight.t()) * (x @ w3_weight.t())
         xs.append(y)
     # train
     merged_weight = train(weights, xs)
@@ -91,7 +91,7 @@ def main_func(args, save=True):
     if save:
         save_dir = os.path.join(args.output_dir, get_output_subdir(args))
         os.makedirs(save_dir, exist_ok=True)
-        torch.save(merged_weight, os.path.join(save_dir, "merged_weight.pt"))
+        torch.save(merged_weight, os.path.join(save_dir, "target_model.pt"))
     # evaluate
     per_expert_diff_mean, per_expert_diff_dist, per_expert_element_wise_diff = evaluate(merged_weight, weights, xs)
     for expert_id in range(8):

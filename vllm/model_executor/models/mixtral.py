@@ -319,6 +319,8 @@ class MixtralMoE(nn.Module):
                                      linear_method=None)
 
     def load_predictors(self):
+        if not PREDICTOR_DIR:
+            return
         self.predictors = []
         for expert_id in range(8):
             state_dict = torch.load(os.path.join(PREDICTOR_DIR, f"e{expert_id}_l{self.layer_idx}", "model.pt"))
@@ -343,11 +345,16 @@ class MixtralMoE(nn.Module):
             # print(f"Before calculating optimal expert selection, on rank {self.tp_rank}", flush=True)
 
             if self.tp_rank == 7:
+                # record top 1 and top 2 expert
+                if is_decode:
+                    with open(f"/root/lm-evaluation-harness/top_experts_l{self.layer_idx}.txt", "a") as f:
+                        for selected_expert in selected_experts:
+                            f.write(f"{selected_expert[0].item()},{selected_expert[1].item()}\n")
                 if MERGED_DIR is not None and self.layer_idx < MERGED_MAX_LAYERS and not NO_MERGED and is_decode:
                     # calculate optimal expert selection
                     # print(f"Calculating optimal expert selection on rank {self.tp_rank}", flush=True)
                     reduced_experts = solve_knapsack_dp(hidden_states, routing_weights, selected_experts, self.predictors, REDUCED_EXPERT_COUNT, self.num_total_experts)
-                    # reduced_experts = torch.tensor([0,1,2,3,4,5,6], dtype=torch.long, device=hidden_states.device)
+                    # reduced_experts = torch.tensor([1,2,3,4,5,6,7], dtype=torch.long, device=hidden_states.device)
                     # broadcast selected_experts to all tp ranks
                     # print("reduced_experts.shape", reduced_experts.shape, flush=True)
                     torch.distributed.broadcast(reduced_experts,
@@ -690,10 +697,21 @@ class MixtralModel(nn.Module):
                     print(f"Loading merged expert weight for layer {layer_idx}.", flush=True)
                     state_dicts = {}
                     for w_name in range(1, 4):
-                        weight_tensor = torch.load(os.path.join(MERGED_DIR, f"w{w_name}_l{layer_idx}", "merged_weight.pt"))
+                        model_path = os.path.join(MERGED_DIR, f"w{w_name}_l{layer_idx}", "merged_weight.pt")
+                        if not os.path.exists(model_path):
+                            model_path = os.path.join(MERGED_DIR, f"w{w_name}_l{layer_idx}", "target_model.pt")
+                        weight_tensor = torch.load(model_path)
+                        if not isinstance(weight_tensor, torch.Tensor):
+                            weight_tensor = weight_tensor["weight"]
                         state_dicts[f"w{w_name}"] = weight_tensor.t()
+                    if expert_layer.w1.weight.data.shape != state_dicts["w1"].shape:
+                        state_dicts["w1"] = state_dicts["w1"].t()
                     expert_layer.w1.weight.data.copy_(state_dicts["w1"])
+                    if expert_layer.w3.weight.data.shape != state_dicts["w3"].shape:
+                        state_dicts["w3"] = state_dicts["w3"].t()
                     expert_layer.w3.weight.data.copy_(state_dicts["w3"])
+                    if expert_layer.w2.weight.data.shape != state_dicts["w2"].shape:
+                        state_dicts["w2"] = state_dicts["w2"].t()
                     expert_layer.w2.weight.data.copy_(state_dicts["w2"])
         except Exception as e:
             print("Error in loading MLP weight", e, flush=True)

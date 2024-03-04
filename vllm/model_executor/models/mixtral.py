@@ -66,18 +66,17 @@ from vllm.sequence import SamplerOutput
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
-NO_MERGED = os.environ.get("MIXTRAL_NO_MERGED", None)
-MERGED_DIR = os.environ.get("MIXTRAL_MERGED_DIR", None)
-PREDICTOR_DIR = os.environ.get("MIXTRAL_PREDICTOR_DIR", None)
-# MIXTRAL_DISCARDED_EXPERTS = os.environ.get("MIXTRAL_DISCARDED_EXPERTS", None)
-REDUCED_EXPERT_COUNT = os.environ.get("MIXTRAL_REDUCED_EXPERT_COUNT", None)
-MERGED_MAX_LAYERS = os.environ.get("MIXTRAL_MERGED_MAX_LAYERS", 32)
-# if MIXTRAL_DISCARDED_EXPERTS is not None:
-#     MIXTRAL_DISCARDED_EXPERTS = [int(x) for x in MIXTRAL_DISCARDED_EXPERTS.split(",")]
-if MERGED_MAX_LAYERS is not None:
-    MERGED_MAX_LAYERS = int(MERGED_MAX_LAYERS)
-if REDUCED_EXPERT_COUNT is not None:
-    REDUCED_EXPERT_COUNT = int(REDUCED_EXPERT_COUNT)
+
+REROUTE_FROM = os.environ.get("MIXTRAL_REROUTE_FROM", None)
+REROUTE_TO = os.environ.get("MIXTRAL_REROUTE_TO", None)
+REROUTE_MAX_LAYERS = os.environ.get("MIXTRAL_REROUTE_MAX_LAYERS", 32)
+
+if REROUTE_FROM is not None:
+    REROUTE_FROM = int(REROUTE_FROM)
+if REROUTE_TO is not None:
+    REROUTE_TO = int(REROUTE_TO)
+if REROUTE_MAX_LAYERS is not None:
+    REROUTE_MAX_LAYERS = int(REROUTE_MAX_LAYERS)
 
 class MixtralParallelism:
     DATA_EXPERT_PARALLEL = "data_expert_parallel"
@@ -305,88 +304,32 @@ class MixtralMoE(nn.Module):
             if idx in self.expert_indicies else None
             for idx in range(self.num_total_experts)
         ])
-        self.merged_expert = None
-        if self.tp_rank == 7:
-            self.merged_expert = mixtral_mlp(self.num_total_experts,
-                                                config.hidden_size,
-                                                config.intermediate_size,
-                                                linear_method=linear_method)
-            # load predictors
-            self.load_predictors()
         self.gate = ReplicatedLinear(config.hidden_size,
                                      self.num_total_experts,
                                      bias=False,
                                      linear_method=None)
 
-    def load_predictors(self):
-        if not PREDICTOR_DIR:
-            return
-        self.predictors = []
-        for expert_id in range(8):
-            state_dict = torch.load(os.path.join(PREDICTOR_DIR, f"e{expert_id}_l{self.layer_idx}", "model.pt"))
-            predictor = Predictor.from_state_dict(state_dict)
-            self.predictors.append(predictor)
-        print(f"Loaded predictors for layer {self.layer_idx}", flush=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         is_decode = hidden_states.shape[0] == 1
-        # print(f"MixtralMoE forward for layer {self.layer_idx}, shape {hidden_states.shape} on rank {self.tp_rank}", flush=True)
-        try:
-            batch_size, sequence_length, hidden_dim = hidden_states.shape
-            hidden_states = hidden_states.view(-1, hidden_dim)
-            # router_logits: (batch * sequence_length, n_experts)
-            router_logits, _ = self.gate(hidden_states)
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        # router_logits: (batch * sequence_length, n_experts)
+        router_logits, _ = self.gate(hidden_states)
 
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(routing_weights,
-                                                        self.top_k,
-                                                        dim=-1)
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-            # print(f"Before calculating optimal expert selection, on rank {self.tp_rank}", flush=True)
-
-            if self.tp_rank == 7:
-                # record top 1 and top 2 expert
-                if is_decode:
-                    with open(f"/root/lm-evaluation-harness/top_experts_l{self.layer_idx}.txt", "a") as f:
-                        for selected_expert in selected_experts:
-                            f.write(f"{selected_expert[0].item()},{selected_expert[1].item()}\n")
-                if MERGED_DIR is not None and self.layer_idx < MERGED_MAX_LAYERS and not NO_MERGED and is_decode:
-                    # calculate optimal expert selection
-                    # print(f"Calculating optimal expert selection on rank {self.tp_rank}", flush=True)
-                    reduced_experts = solve_knapsack_dp(hidden_states, routing_weights, selected_experts, self.predictors, REDUCED_EXPERT_COUNT, self.num_total_experts)
-                    # reduced_experts = torch.tensor([1,2,3,4,5,6,7], dtype=torch.long, device=hidden_states.device)
-                    # broadcast selected_experts to all tp ranks
-                    # print("reduced_experts.shape", reduced_experts.shape, flush=True)
-                    torch.distributed.broadcast(reduced_experts,
-                                                src=self.tp_rank,
-                                                group=get_tensor_model_parallel_group())
-                    # torch.cuda.synchronize()
-                    # print(f"Reduced experts for layer {self.layer_idx} are {reduced_experts}", flush=True)
-            else:
-                if MERGED_DIR is not None and self.layer_idx < MERGED_MAX_LAYERS and not NO_MERGED and is_decode:
-                    reduced_experts = torch.zeros(REDUCED_EXPERT_COUNT, dtype=torch.long, device=hidden_states.device)
-                    # print(f"Waiting for reduced_experts on rank {self.tp_rank}", flush=True)
-                    torch.distributed.broadcast(reduced_experts,
-                                                src=7,
-                                                group=get_tensor_model_parallel_group())
-                    # torch.cuda.synchronize()
-                    # print(f"Reduced experts for layer {self.layer_idx} are {reduced_experts}", flush=True)
-            if MERGED_DIR is not None and self.layer_idx < MERGED_MAX_LAYERS and not NO_MERGED and is_decode:
-                reduced_experts_set = set(reduced_experts.tolist())
-                discarded_experts_list = [x for x in range(self.num_total_experts) if x not in reduced_experts_set]
-                discarded_experts_tensor = torch.tensor(discarded_experts_list, dtype=torch.long, device=hidden_states.device)
-        except Exception as e:
-            print("Error in MixtralMoE forward", e, flush=True)
-            raise e
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights,
+                                                    self.top_k,
+                                                    dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        if self.layer_idx < REROUTE_MAX_LAYERS and is_decode and REROUTE_FROM is not None and REROUTE_TO is not None:
+            selected_experts[selected_experts == REROUTE_FROM] = REROUTE_TO
 
 
         if self.parallel_method == MixtralParallelism.TENSOR_EXPERT_PARALLEL:
             try:
                 final_hidden_states = None
                 for expert_idx in self.expert_indicies:
-                    if MERGED_DIR is not None and self.layer_idx < MERGED_MAX_LAYERS and is_decode:
-                        if expert_idx in discarded_experts_list and not NO_MERGED:
-                            continue
 
                     expert_layer = self.experts[expert_idx]
                     expert_mask = (selected_experts == expert_idx)
@@ -399,20 +342,7 @@ class MixtralMoE(nn.Module):
                         final_hidden_states = current_hidden_states
                     else:
                         final_hidden_states.add_(current_hidden_states)
-                if self.tp_rank == 7 and MERGED_DIR is not None and self.layer_idx < MERGED_MAX_LAYERS and not NO_MERGED and is_decode:
-                    merged_expert_layer = self.merged_expert
-                    expert_mask = torch.isin(selected_experts, discarded_experts_tensor)
-                    expert_weights = (routing_weights * expert_mask).sum(dim=-1,
-                                                                        keepdim=True)
-                    merged_hidden_states = merged_expert_layer(hidden_states).mul_(
-                        expert_weights)
-                    if final_hidden_states is None:
-                        final_hidden_states = merged_hidden_states
-                    else:
-                        final_hidden_states.add_(merged_hidden_states)
-                if final_hidden_states is None:
-                    # No experts were assigned to this rank, so we return zeros.
-                    final_hidden_states = torch.zeros_like(hidden_states)
+
                 return tensor_model_parallel_all_reduce(final_hidden_states).view(
                     batch_size, sequence_length, hidden_dim)
             except Exception as e:
@@ -685,37 +615,6 @@ class MixtralModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def load_merged_weight(self):
-        if MERGED_DIR is None:
-            return
-        try:
-            for layer_idx, layer in enumerate(self.layers):
-                if layer_idx >= MERGED_MAX_LAYERS:
-                    continue
-                if get_tensor_model_parallel_rank() == 7:
-                    expert_layer = layer.block_sparse_moe.merged_expert
-                    print(f"Loading merged expert weight for layer {layer_idx}.", flush=True)
-                    state_dicts = {}
-                    for w_name in range(1, 4):
-                        model_path = os.path.join(MERGED_DIR, f"w{w_name}_l{layer_idx}", "merged_weight.pt")
-                        if not os.path.exists(model_path):
-                            model_path = os.path.join(MERGED_DIR, f"w{w_name}_l{layer_idx}", "target_model.pt")
-                        weight_tensor = torch.load(model_path)
-                        if not isinstance(weight_tensor, torch.Tensor):
-                            weight_tensor = weight_tensor["weight"]
-                        state_dicts[f"w{w_name}"] = weight_tensor.t()
-                    if expert_layer.w1.weight.data.shape != state_dicts["w1"].shape:
-                        state_dicts["w1"] = state_dicts["w1"].t()
-                    expert_layer.w1.weight.data.copy_(state_dicts["w1"])
-                    if expert_layer.w3.weight.data.shape != state_dicts["w3"].shape:
-                        state_dicts["w3"] = state_dicts["w3"].t()
-                    expert_layer.w3.weight.data.copy_(state_dicts["w3"])
-                    if expert_layer.w2.weight.data.shape != state_dicts["w2"].shape:
-                        state_dicts["w2"] = state_dicts["w2"].t()
-                    expert_layer.w2.weight.data.copy_(state_dicts["w2"])
-        except Exception as e:
-            print("Error in loading MLP weight", e, flush=True)
-            raise e
 
 class MixtralForCausalLM(nn.Module):
 
@@ -807,4 +706,3 @@ class MixtralForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
-        self.model.load_merged_weight()

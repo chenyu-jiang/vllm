@@ -240,10 +240,12 @@ def solve_knapsack_dp(features: torch.Tensor,
                         selected_experts: torch.Tensor,
                         predictors: List[Predictor],
                         k_experts_to_select: int,
-                        n_experts: int):
+                        layer_id: int):
     values = calculate_loss(features, expert_weights, selected_experts, predictors)
     expert_ids = torch.argsort(values, dim=0, descending=True)
     top_k = expert_ids[:k_experts_to_select].tolist()
+    if layer_id != 1:
+        return expert_ids[:k_experts_to_select]
     if 3 in top_k:
         return expert_ids[:k_experts_to_select]
     else:
@@ -345,15 +347,10 @@ class MixtralMoE(nn.Module):
             # print(f"Before calculating optimal expert selection, on rank {self.tp_rank}", flush=True)
 
             if self.tp_rank == 7:
-                # record top 1 and top 2 expert
-                if is_decode:
-                    with open(f"/root/lm-evaluation-harness/top_experts_l{self.layer_idx}.txt", "a") as f:
-                        for selected_expert in selected_experts:
-                            f.write(f"{selected_expert[0].item()},{selected_expert[1].item()}\n")
                 if MERGED_DIR is not None and self.layer_idx < MERGED_MAX_LAYERS and not NO_MERGED and is_decode:
                     # calculate optimal expert selection
                     # print(f"Calculating optimal expert selection on rank {self.tp_rank}", flush=True)
-                    reduced_experts = solve_knapsack_dp(hidden_states, routing_weights, selected_experts, self.predictors, REDUCED_EXPERT_COUNT, self.num_total_experts)
+                    reduced_experts = solve_knapsack_dp(hidden_states, routing_weights, selected_experts, self.predictors, REDUCED_EXPERT_COUNT, self.layer_idx)
                     # reduced_experts = torch.tensor([1,2,3,4,5,6,7], dtype=torch.long, device=hidden_states.device)
                     # broadcast selected_experts to all tp ranks
                     # print("reduced_experts.shape", reduced_experts.shape, flush=True)

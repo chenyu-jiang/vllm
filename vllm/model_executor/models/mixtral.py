@@ -396,10 +396,13 @@ class MixtralMoE(nn.Module):
                     # select experts with the highest loss to preserve
                     reduced_expert_ids = torch.argsort(loss_per_expert, dim=0, descending=True)
                     reduced_expert_ids = reduced_expert_ids.tolist()
-                    if 3 in reduced_expert_ids[:REDUCED_EXPERT_COUNT]:
-                        reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
+                    if self.layer_idx == 1:
+                        if 3 in reduced_expert_ids[:REDUCED_EXPERT_COUNT]:
+                            reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
+                        else:
+                            reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT-1] + [3]
                     else:
-                        reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT-1] + [3]
+                        reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
                     merged_expert_ids = [x for x in range(self.num_total_experts) if x not in reduced_expert_ids]
                     merged_expert_ids_tensor = torch.tensor(merged_expert_ids, dtype=torch.long, device=hidden_states.device)
                     # reconstruct the final hidden states

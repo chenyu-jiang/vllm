@@ -5,6 +5,8 @@ from typing import List
 import numpy as np
 import torch
 
+import tqdm
+
 from vllm.model_executor.weight_utils import hf_model_weights_iterator
 
 def _to_torch_dtype(dtype):
@@ -20,30 +22,32 @@ def fix_seed(seed):
     torch.cuda.manual_seed(seed)
 
 def evaluate(merged_weight: torch.Tensor, weights: List[torch.Tensor], xs: List[torch.Tensor]):
-    per_expert_diff_norm_mean = []
-    per_expert_diff_norm_dist = []
-    per_expert_element_wise_diff = []
-    for x, w in zip(xs, weights):
-        diff_mat = x @ (merged_weight - w.t())
-        diff = torch.norm(diff_mat, dim=1)
-        element_wise_diff = torch.mean(torch.abs(diff_mat))
-        per_expert_diff_norm_mean.append(torch.mean(diff).item())
-        per_expert_diff_norm_dist.append(list(diff.float().cpu().numpy()))
-        per_expert_element_wise_diff.append(element_wise_diff.item())
-    return per_expert_diff_norm_mean, per_expert_diff_norm_dist, per_expert_element_wise_diff
+    with torch.no_grad():
+        per_expert_diff_norm_mean = []
+        per_expert_diff_norm_dist = []
+        per_expert_element_wise_diff = []
+        for x, w in zip(xs, weights):
+            diff_mat = x @ (merged_weight - w.t())
+            diff = torch.norm(diff_mat, dim=1)
+            element_wise_diff = torch.mean(torch.abs(diff_mat))
+            per_expert_diff_norm_mean.append(torch.mean(diff).item())
+            per_expert_diff_norm_dist.append(list(diff.float().cpu().numpy()))
+            per_expert_element_wise_diff.append(element_wise_diff.item())
+        return per_expert_diff_norm_mean, per_expert_diff_norm_dist, per_expert_element_wise_diff
 
 def evaluate_with_ys(merged_weight: torch.Tensor, xs: List[torch.Tensor], ys: List[torch.Tensor]):
-    per_expert_diff_norm_mean = []
-    per_expert_diff_norm_dist = []
-    per_expert_element_wise_diff = []
-    for x, y in zip(xs, ys):
-        diff_mat = y - x @ merged_weight
-        diff = torch.norm(diff_mat, dim=1)
-        element_wise_diff = torch.mean(torch.abs(diff_mat))
-        per_expert_diff_norm_mean.append(torch.mean(diff).item())
-        per_expert_diff_norm_dist.append(list(diff.float().cpu().numpy()))
-        per_expert_element_wise_diff.append(element_wise_diff.item())
-    return per_expert_diff_norm_mean, per_expert_diff_norm_dist, per_expert_element_wise_diff
+    with torch.no_grad():
+        per_expert_diff_norm_mean = []
+        per_expert_diff_norm_dist = []
+        per_expert_element_wise_diff = []
+        for x, y in zip(xs, ys):
+            diff_mat = y - x @ merged_weight
+            diff = torch.norm(diff_mat, dim=1)
+            element_wise_diff = torch.mean(torch.abs(diff_mat))
+            per_expert_diff_norm_mean.append(torch.mean(diff).item())
+            per_expert_diff_norm_dist.append(list(diff.float().cpu().numpy()))
+            per_expert_element_wise_diff.append(element_wise_diff.item())
+        return per_expert_diff_norm_mean, per_expert_diff_norm_dist, per_expert_element_wise_diff
 
 def get_output_subdir(args):
     return f"w{args.weight_id}_l{args.layer_id}" + ("" if args.dtype == "bfloat16" else f"_{args.dtype}")
@@ -61,6 +65,59 @@ def train(weights: List[torch.Tensor], xs: List[torch.Tensor], alpha=0.9):
     # compute the optimal weight
     optimal_weight = inv_sum_inner_products @ sum_xT_x_w
     return optimal_weight
+
+class LinearRegression(torch.nn.Module):
+    def __init__(self, x_dim, y_dim):
+        super(LinearRegression, self).__init__()
+        self.linear = torch.nn.Linear(x_dim, y_dim)
+
+    def forward(self, x):
+        return self.linear(x)
+
+def train_with_y_torch(xs: List[torch.Tensor], ys: List[torch.Tensor], alpha=0.9):
+    from torch.utils.data import DataLoader, TensorDataset
+    from torch.optim import Adam
+    from torch.nn import MSELoss
+    from torch.utils.data import DataLoader
+
+    # Create a dataset and a dataloader
+    xs_gpu = torch.cat(xs, dim=0).to("cuda")
+    ys_gpu = torch.cat(ys, dim=0).to("cuda")
+
+    # Create a model and a loss function
+    model = LinearRegression(xs[0].shape[1], ys[0].shape[1]).to("cuda").to(xs[0].dtype)
+    criterion = MSELoss()
+
+    # Create an optimizer
+    optimizer = Adam(model.parameters())
+
+    n_batches = xs_gpu.shape[0] // 4096
+
+    # Train the model
+    avg_loss = 0
+    for epoch in tqdm.trange(100):
+        for batch_idx in range(n_batches):
+            x = xs_gpu[batch_idx * 4096: (batch_idx + 1) * 4096]
+            y = ys_gpu[batch_idx * 4096: (batch_idx + 1) * 4096]
+            y_pred = model(x)
+            loss = criterion(y_pred, y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            avg_loss += loss.item()
+        avg_loss /= n_batches
+        tqdm.tqdm.write(f"Epoch {epoch} - Loss: {avg_loss}")
+        avg_loss = 0
+
+    return model.linear.weight.t()
+
+def train_with_y_scikit(xs: List[torch.Tensor], ys: List[torch.Tensor], alpha=0.9):
+    from sklearn.linear_model import LinearRegression
+    xs_cpu = [x.cpu().float().numpy() for x in xs]
+    ys_cpu = [y.cpu().float().numpy() for y in ys]
+
+    reg = LinearRegression().fit(np.concatenate(xs_cpu, axis=0), np.concatenate(ys_cpu, axis=0))
+    return torch.tensor(reg.coef_, dtype=xs[0].dtype, device=xs[0].device)
 
 def train_with_y(xs: List[torch.Tensor], ys: List[torch.Tensor], alpha=0.9):
     # compute inner products of xs
@@ -119,14 +176,21 @@ def main_func(args, save=True):
         y = torch.nn.functional.silu(x @ w1.t()) * (x @ w3.t())
         y = y @ w2.t()
         ys.append(y)
+    del data
     # train
-    merged_weight = train_with_y(xs, ys)
+    # merged_weight = train_with_y(xs, ys)
+    # merged_weight = train_with_y_scikit(xs, ys)
+    xs = [x.cpu() for x in xs]
+    ys = [y.cpu() for y in ys]
+    merged_weight = train_with_y_torch(xs, ys)
     # save
     if save:
         save_dir = os.path.join(args.output_dir, args.regressor_type, get_output_subdir(args))
         os.makedirs(save_dir, exist_ok=True)
         torch.save(merged_weight, os.path.join(save_dir, "merged_weight.pt"))
     # evaluate
+    xs = [x.to(args.device) for x in xs]
+    ys = [y.to(args.device) for y in ys]
     per_expert_diff_mean, per_expert_diff_dist, per_expert_element_wise_diff = evaluate_with_ys(merged_weight, xs, ys)
     for expert_id in range(8):
         print(f"Expert {expert_id} - Mean diff: {per_expert_diff_mean[expert_id]} - Element wise diff: {per_expert_element_wise_diff[expert_id]}")

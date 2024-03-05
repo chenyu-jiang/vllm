@@ -5,7 +5,11 @@ from typing import List
 import numpy as np
 import torch
 
+from tqdm import tqdm
+
 from vllm.model_executor.weight_utils import hf_model_weights_iterator
+
+from sklearn.linear_model import RANSACRegressor
 
 def _to_torch_dtype(dtype):
     if not isinstance(dtype, torch.dtype):
@@ -49,6 +53,63 @@ def train(weights: List[torch.Tensor], xs: List[torch.Tensor], alpha=0.9):
     optimal_weight = inv_sum_inner_products @ sum_xT_x_w
     return optimal_weight
 
+def train_ransac_scikit(weights: List[torch.Tensor], xs: List[torch.Tensor]):
+    ys = [x @ w.t() for x, w in zip(xs, weights)]
+    ys_cpu = [y.cpu().float().numpy() for y in ys]
+    xs_cpu = [x.cpu().float().numpy() for x in xs]
+    del ys
+    xs_concat = np.concatenate(xs_cpu, axis=0)
+    ys_concat = np.concatenate(ys_cpu, axis=0)
+    # RANSAC
+    ransac = RANSACRegressor(random_state=42)
+    reg = ransac.fit(xs_concat, ys_concat)
+    return torch.tensor(reg.estimator_.coef_, dtype=xs[0].dtype, device=xs[0].device)
+
+def train_ransac(weights: List[torch.Tensor], xs: List[torch.Tensor],
+                 max_iter=10000,
+                 min_samples_multiplier=0.2,
+                 residual_threshold_multiplier=0.1,
+                 min_inliners_multiplier=0.5):
+    total_samples = sum([x.shape[0] for x in xs])
+    # first calculate the avg norm of original outputs
+    avg_norms = [torch.mean(torch.linalg.norm(x @ w.t(), dim=1)).item() for (x, w) in zip(xs, weights)]
+    iter_count = 0
+    best_error = float("inf")
+    best_weight = None
+    with tqdm(total=max_iter) as pbar:
+        while iter_count < max_iter:
+            # random sample subset from each expert
+            sampled_indices = [torch.tensor(np.random.choice(x.shape[0], int(x.shape[0] * min_samples_multiplier), replace=False)
+                                            , dtype=torch.long, device=x.device) for x in xs]
+            sampled_xs = [x[sampled_indices] for x, sampled_indices in zip(xs, sampled_indices)]
+            # fit
+            merged_weight, merged_bias = train(weights, sampled_xs)
+            del sampled_indices
+            del sampled_xs
+            # eval
+            confirmed_inliner_masks = []
+            confirmed_inliner_errors = []
+            confirmed_inliner_counts = []
+            for (x, w, norm) in zip(xs, weights, avg_norms):
+                diff = torch.linalg.norm(x @ (merged_weight - w.t()), dim=1)
+                confirmed_inliner_masks.append(diff < norm * residual_threshold_multiplier)
+                confirmed_inliner_errors.append(torch.sum(diff * confirmed_inliner_masks[-1]))
+                confirmed_inliner_counts.append(torch.sum(confirmed_inliner_masks[-1]).item())
+            n_inliners = sum(confirmed_inliner_counts)
+            avg_error = (sum(confirmed_inliner_errors) / n_inliners).item()
+            if n_inliners >= total_samples * min_inliners_multiplier:
+                # found a acceptable model
+                if avg_error < best_error:
+                    best_error = avg_error
+                    best_weight = merged_weight
+                    tqdm.write(f"Found a better model with avg error {avg_error} and inliner ratio {n_inliners / total_samples}")
+                else:
+                    tqdm.write(f"Found a model with avg error {avg_error} and inliner ratio {n_inliners / total_samples}, but not better than previous best")
+            else:
+                tqdm.write(f"Failed to find a model with enough inliners: {n_inliners / total_samples}")
+            iter_count += 1
+            pbar.update(1)
+    return best_weight
 
 def create_dataloaders(args):
     data_per_expert = []
@@ -77,10 +138,13 @@ def main_func(args, save=True):
     # load data
     data = create_dataloaders(args)
     # train
-    merged_weight = train(weights, data)
+    if args.regressor_type == "plain":
+        merged_weight = train(weights, data)
+    elif args.regressor_type == "ransac":
+        merged_weight = train_ransac(weights, data)
     # save
     if save:
-        save_dir = os.path.join(args.output_dir, get_output_subdir(args))
+        save_dir = os.path.join(args.output_dir, args.regressor_type, get_output_subdir(args))
         os.makedirs(save_dir, exist_ok=True)
         torch.save(merged_weight, os.path.join(save_dir, "merged_weight.pt"))
     # evaluate
@@ -114,6 +178,7 @@ def main():
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--weight_id", type=int, default=1)
     parser.add_argument("--layer_id", type=int, default=0)
+    parser.add_argument("--regressor_type", type=str, default="plain", choices=["plain", "ransac"])
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     args = parser.parse_args()

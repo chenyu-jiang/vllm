@@ -79,6 +79,11 @@ if MERGED_MAX_LAYERS is not None:
 if REDUCED_EXPERT_COUNT is not None:
     REDUCED_EXPERT_COUNT = int(REDUCED_EXPERT_COUNT)
 
+_EXPERT_ACTIVATION_DUMP_PATH = os.environ.get("VLLM_MIXTRAL_DUMP_EXPERT_ACTIVATION", None)
+_EXPERT_ACTIVATION_DUMP_LAYER = os.environ.get("VLLM_MIXTRAL_DUMP_EXPERT_ACTIVATION_LAYER", None)
+if _EXPERT_ACTIVATION_DUMP_LAYER is not None:
+    _EXPERT_ACTIVATION_DUMP_LAYER = int(_EXPERT_ACTIVATION_DUMP_LAYER)
+
 class MixtralParallelism:
     DATA_EXPERT_PARALLEL = "data_expert_parallel"
     TENSOR_EXPERT_PARALLEL = "tensor_expert_parallel"
@@ -319,6 +324,10 @@ class MixtralMoE(nn.Module):
                                      self.num_total_experts,
                                      bias=False,
                                      linear_method=None)
+        self.expert_hidden_states_ = {}
+        self.expert_hidden_states_vectors_counter = {}
+        self.expert_dump_counter = {}
+        self.dumped = False
 
     def load_predictors(self):
         if not PREDICTOR_DIR:
@@ -348,6 +357,29 @@ class MixtralMoE(nn.Module):
         except Exception as e:
             print("Error in MixtralMoE forward", e, flush=True)
             raise e
+
+        if _EXPERT_ACTIVATION_DUMP_PATH is not None and _EXPERT_ACTIVATION_DUMP_LAYER is not None and self.layer_idx == _EXPERT_ACTIVATION_DUMP_LAYER and is_decode:
+            # store the input hidden states
+            for expert_idx in self.expert_indicies:
+                if expert_idx not in self.expert_hidden_states_:
+                    self.expert_hidden_states_[expert_idx] = []
+                    self.expert_hidden_states_vectors_counter[expert_idx] = 0
+                    self.expert_dump_counter[expert_idx] = 0
+                self.expert_hidden_states_[expert_idx].append(hidden_states.float().cpu().numpy())
+                self.expert_hidden_states_vectors_counter[expert_idx] += hidden_states.shape[0]
+                if self.expert_hidden_states_vectors_counter[expert_idx] >= 65536:
+                    # dump to file
+                    concated = np.concatenate(self.expert_hidden_states_[expert_idx], axis=0)
+                    np.savez_compressed(f"{_EXPERT_ACTIVATION_DUMP_PATH}_e{expert_idx}_l{self.layer_idx}_{self.expert_dump_counter[expert_idx]}.npz", concated)
+                    self.expert_hidden_states_[expert_idx] = []
+                    self.expert_dump_counter[expert_idx] += 1
+                    self.expert_hidden_states_vectors_counter[expert_idx] = 0
+                    self.dumped = True
+            # all reduce dumped flag
+            dumped_flag = torch.zeros(1, dtype=torch.float, device=hidden_states.device) if not self.dumped else torch.ones(1, dtype=torch.float, device=hidden_states.device)
+            reduced_flag = tensor_model_parallel_all_reduce(dumped_flag)
+            if reduced_flag.item() == self.tp_size:
+                exit(0)
 
 
         if self.parallel_method == MixtralParallelism.TENSOR_EXPERT_PARALLEL:
@@ -396,10 +428,13 @@ class MixtralMoE(nn.Module):
                     # select experts with the highest loss to preserve
                     reduced_expert_ids = torch.argsort(loss_per_expert, dim=0, descending=True)
                     reduced_expert_ids = reduced_expert_ids.tolist()
-                    if 3 in reduced_expert_ids[:REDUCED_EXPERT_COUNT]:
-                        reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
+                    if self.layer_idx == 1:
+                        if 3 in reduced_expert_ids[:REDUCED_EXPERT_COUNT]:
+                            reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
+                        else:
+                            reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT-1] + [3]
                     else:
-                        reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT-1] + [3]
+                        reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
                     merged_expert_ids = [x for x in range(self.num_total_experts) if x not in reduced_expert_ids]
                     merged_expert_ids_tensor = torch.tensor(merged_expert_ids, dtype=torch.long, device=hidden_states.device)
                     # reconstruct the final hidden states

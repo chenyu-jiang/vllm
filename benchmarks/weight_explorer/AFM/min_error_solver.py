@@ -57,6 +57,36 @@ def calculate_loss(features: torch.Tensor,
     #     losses.append(per_sample_losses)
     # return losses
 
+def solve_min_max_token_loss(expert_weights: torch.Tensor,
+                             selected_experts: torch.Tensor,
+                             losses_per_expert: List[torch.Tensor],
+                             k_experts_to_select: int):
+    with gp.Env(empty=True):
+        # disable output
+        gp.setParam("OutputFlag", 0)
+        # create the ILP model
+        model = gp.Model("ILP")
+        # create the variables
+        x = model.addVars(8, vtype=gp.GRB.BINARY, name="x")
+        # construct the loss function
+        z = model.addVar(vtype=gp.GRB.CONTINUOUS, name="z")
+        # set the objective
+        model.setObjective(z, gp.GRB.MINIMIZE)
+        # add constraints
+        for token_idx in range(expert_weights.shape[0]):
+            loss_per_token = (losses_per_expert[selected_experts[token_idx, 0].item()][token_idx].item() * expert_weights[token_idx, 0].item()) * (1-x[selected_experts[token_idx, 0].item()]) \
+                            + (losses_per_expert[selected_experts[token_idx, 1].item()][token_idx].item() * expert_weights[token_idx, 1].item()) * (1-x[selected_experts[token_idx, 1].item()])
+            model.addConstr(z >= loss_per_token)
+        model.addConstr(x.sum() <= k_experts_to_select)
+        # solve the model
+        model.optimize()
+        # get the selected experts
+        result = []
+        for expert_id in range(8):
+            if x[expert_id].x > 0.5:
+                result.append(expert_id)
+    return result
+
 def solve_ilp(features: torch.Tensor,
               expert_weights: torch.Tensor,
               selected_experts: torch.Tensor,
@@ -148,6 +178,20 @@ def evaluate_loss(features: torch.Tensor,
                 total_loss += losses[sample_idx][expert_idx]
     return total_loss
 
+def evaluate_min_max_loss(expert_weights: torch.Tensor,
+                          selected_experts: torch.Tensor,
+                          losses_per_expert: List[torch.Tensor],
+                          opt_selection: Set[int]):
+    max_loss = 0
+    for sample_idx in range(expert_weights.shape[0]):
+        per_sample_loss = 0
+        for expert_idx in range(selected_experts.shape[1]):
+            expert_id = selected_experts[sample_idx, expert_idx].item()
+            if expert_id not in opt_selection:
+                per_sample_loss += (losses_per_expert[expert_id][sample_idx] * expert_weights[sample_idx, expert_idx]).item()
+        max_loss = max(max_loss, per_sample_loss)
+    return max_loss
+
 def create_dataloaders(args):
     per_expert_data = []
     for i in range(8):
@@ -190,8 +234,8 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--k_experts_to_select", type=int, default=4)
     parser.add_argument("--layer_idx", type=int, default=0)
-    parser.add_argument("--predictor_dir", type=str, required=True)
-    parser.add_argument("--data_dir", type=str, required=True)
+    # parser.add_argument("--predictor_dir", type=str, required=True)
+    # parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=64)
 
     return parser.parse_args()
@@ -199,27 +243,48 @@ def parse_args():
 def main():
     args = parse_args()
     # load the predictors
-    predictors = []
-    for expert_id in range(8):
-        predictor = torch.load(f"{args.predictor_dir}/e{expert_id}_l{args.layer_idx}/model.pt")
-        predictors.append(Predictor.from_state_dict(predictor).to(_to_torch_dtype(args.dtype)).to(args.device))
+    # predictors = []
+    # for expert_id in range(8):
+    #     predictor = torch.load(f"{args.predictor_dir}/e{expert_id}_l{args.layer_idx}/model.pt")
+    #     predictors.append(Predictor.from_state_dict(predictor).to(_to_torch_dtype(args.dtype)).to(args.device))
     # load the data
-    features, expert_weights, selected_experts = create_dataloaders(args)
+    # features, expert_weights, selected_experts = create_dataloaders(args)
     # solve the ILP problem
     # opt_selection = solve_ilp(features, expert_weights, selected_experts, predictors, args.k_experts_to_select, 8)
-    opt_selection = solve_knapsack_dp(features, expert_weights, selected_experts, predictors, args.k_experts_to_select, 8)
+    # opt_selection = solve_knapsack_dp(features, expert_weights, selected_experts, predictors, args.k_experts_to_select, 8)
+    
+    # generate random inputs
+    expert_weights = torch.rand(args.batch_size, 2, dtype=_to_torch_dtype(args.dtype), device=args.device)
+    expert_weights /= expert_weights.sum(dim=0, keepdim=True)
+    selected_experts = []
+    for i in range(args.batch_size):
+        # first sample a expert
+        expert_id = np.random.randint(8)
+        # then sample a second expert
+        expert_id_2 = np.random.randint(8)
+        while expert_id_2 == expert_id:
+            expert_id_2 = np.random.randint(8)
+        selected_experts.append([expert_id, expert_id_2])
+    selected_experts = torch.tensor(selected_experts, dtype=torch.long, device=args.device)
+    # generate random losses
+    losses_per_expert = []
+    for i in range(8):
+        loss = torch.rand(args.batch_size, dtype=_to_torch_dtype(args.dtype), device=args.device)
+        losses_per_expert.append(loss)
+    opt_selection = solve_min_max_token_loss(expert_weights, selected_experts, losses_per_expert, args.k_experts_to_select)
     # evaluate the loss
-    total_loss = evaluate_loss(features, expert_weights, selected_experts, predictors, opt_selection)
-    print("Optimal selection", opt_selection, "with loss", total_loss.item())
+    # total_loss = evaluate_loss(features, expert_weights, selected_experts, predictors, opt_selection)
+    max_loss = evaluate_min_max_loss(expert_weights, selected_experts, losses_per_expert, opt_selection)
+    print("Optimal selection", opt_selection, "with loss", max_loss)
     # certify result optimality
     for i in range(20):
         # generate ranodm selection
         random_selection = np.random.choice(8, args.k_experts_to_select, replace=False)
         # evaluate the loss
-        random_loss = evaluate_loss(features, expert_weights, selected_experts, predictors, random_selection)
-        # print("Random selection", random_selection, "with loss", random_loss.item())
+        random_loss = evaluate_min_max_loss(expert_weights, selected_experts, losses_per_expert, random_selection)
+        print("Random selection", random_selection, "with loss", random_loss)
         # compare the loss
-        assert random_loss >= total_loss - 1e-6, f"Random selection {random_selection} has lower loss {random_loss} than optimal selection {opt_selection} with loss {total_loss}"
+        assert random_loss >= max_loss - 1e-6, f"Random selection {random_selection} has lower loss {random_loss} than optimal selection {opt_selection} with loss {max_loss}"
     print("Optimality certified.")
 
 

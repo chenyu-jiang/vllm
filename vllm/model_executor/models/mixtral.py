@@ -252,6 +252,36 @@ def solve_knapsack_dp(features: torch.Tensor,
         return torch.concat([expert_ids[:k_experts_to_select-1], torch.tensor([3], dtype=torch.long, device=features.device)], dim=0)
     # return expert_ids[:k_experts_to_select]
 
+def solve_min_max_token_loss(expert_weights: torch.Tensor,
+                             selected_experts: torch.Tensor,
+                             losses_per_expert: List[torch.Tensor],
+                             k_experts_to_select: int):
+    with gp.Env(empty=True):
+        # disable output
+        gp.setParam("OutputFlag", 0)
+        # create the ILP model
+        model = gp.Model("ILP")
+        # create the variables
+        x = model.addVars(8, vtype=gp.GRB.BINARY, name="x")
+        # construct the loss function
+        z = model.addVar(vtype=gp.GRB.CONTINUOUS, name="z")
+        # set the objective
+        model.setObjective(z, gp.GRB.MINIMIZE)
+        # add constraints
+        for token_idx in range(expert_weights.shape[0]):
+            loss_per_token = (losses_per_expert[selected_experts[token_idx, 0].item()][token_idx].item() * expert_weights[token_idx, 0].item()) * (1-x[selected_experts[token_idx, 0].item()]) \
+                            + (losses_per_expert[selected_experts[token_idx, 1].item()][token_idx].item() * expert_weights[token_idx, 1].item()) * (1-x[selected_experts[token_idx, 1].item()])
+            model.addConstr(z >= loss_per_token)
+        model.addConstr(x.sum() <= k_experts_to_select)
+        # solve the model
+        model.optimize()
+        # get the selected experts
+        result = []
+        for expert_id in range(8):
+            if x[expert_id].x > 0.5:
+                result.append(expert_id)
+    return result
+
 class MixtralMoE(nn.Module):
 
     def __init__(
@@ -339,8 +369,8 @@ class MixtralMoE(nn.Module):
             # router_logits: (batch * sequence_length, n_experts)
             router_logits, _ = self.gate(hidden_states)
 
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(routing_weights,
+            routing_weights_full = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(routing_weights_full,
                                                         self.top_k,
                                                         dim=-1)
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
@@ -385,24 +415,44 @@ class MixtralMoE(nn.Module):
                 if self.tp_rank == 7:
                     merged_expert_layer = self.merged_expert
                     merged_hidden_states = merged_expert_layer(hidden_states)
+                    # calculate importance score of each token
+                    # logp = torch.log(routing_weights_full + 1e-20)
+                    # entropy = -torch.sum(routing_weights_full * logp, dim=1)
+                    # select top k tokens with the lowest entropy until REDUCED_EXPERT_COUNT expert is selected
+                    top_sample_ids = torch.argsort(routing_weights[:,0], descending=True)
+                    reduced_expert_ids = []
+                    for token_id in top_sample_ids:
+                        selected_experts_per_token = selected_experts[token_id].tolist()
+                        for e in selected_experts_per_token[:1]:
+                            if e not in reduced_expert_ids:
+                                reduced_expert_ids.append(e)
+                                if len(reduced_expert_ids) == REDUCED_EXPERT_COUNT:
+                                    break
+                        if len(reduced_expert_ids) == REDUCED_EXPERT_COUNT:
+                            break
                     # calculate total loss for merging each expert
-                    loss_per_expert = []
-                    for expert_id in range(self.num_total_experts):
-                        expert_mask = (selected_experts == expert_id)
-                        expert_weight = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
-                        loss = torch.linalg.norm(final_hidden_states_per_expert[expert_id] - merged_hidden_states, dim=1) * expert_weight
-                        loss_per_expert.append(loss.sum())
-                    loss_per_expert = torch.stack(loss_per_expert, dim=0)
-                    # select experts with the highest loss to preserve
-                    reduced_expert_ids = torch.argsort(loss_per_expert, dim=0, descending=True)
-                    reduced_expert_ids = reduced_expert_ids.tolist()
+                    # loss_per_expert = []
+                    # for expert_id in range(self.num_total_experts):
+                    #     expert_mask = (selected_experts == expert_id)
+                    #     expert_weight = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
+                    #     norm = torch.linalg.norm(final_hidden_states_per_expert[expert_id] - merged_hidden_states, dim=1, keepdim=True)
+                    #     loss = norm * expert_weight
+                    #     loss_per_expert.append(loss.sum())
+                    #     # loss_per_expert.append(loss)
+                    # loss_per_expert = torch.stack(loss_per_expert, dim=0)
+                    # # select experts with the highest loss to preserve
+                    # reduced_expert_ids = torch.argsort(loss_per_expert, dim=0, descending=True)
+                    # reduced_expert_ids = reduced_expert_ids.tolist()
+                    # if self.layer_idx == 1:
+                    #     if 3 in reduced_expert_ids[:REDUCED_EXPERT_COUNT]:
+                    #         reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
+                    #     else:
+                    #         reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT-1] + [3]
+                    # else:
+                    #     reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
+                    # reduced_expert_ids = solve_min_max_token_loss(routing_weights, selected_experts, loss_per_expert, REDUCED_EXPERT_COUNT)
                     if self.layer_idx == 1:
-                        if 3 in reduced_expert_ids[:REDUCED_EXPERT_COUNT]:
-                            reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
-                        else:
-                            reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT-1] + [3]
-                    else:
-                        reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
+                        print(f"Reduced experts for layer {self.layer_idx} are {reduced_expert_ids}", flush=True)
                     merged_expert_ids = [x for x in range(self.num_total_experts) if x not in reduced_expert_ids]
                     merged_expert_ids_tensor = torch.tensor(merged_expert_ids, dtype=torch.long, device=hidden_states.device)
                     # reconstruct the final hidden states

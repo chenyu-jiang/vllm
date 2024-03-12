@@ -70,6 +70,7 @@ NO_MERGED = os.environ.get("MIXTRAL_NO_MERGED", None)
 MERGED_DIR = os.environ.get("MIXTRAL_MERGED_DIR", None)
 PREDICTOR_DIR = os.environ.get("MIXTRAL_PREDICTOR_DIR", None)
 # MIXTRAL_DISCARDED_EXPERTS = os.environ.get("MIXTRAL_DISCARDED_EXPERTS", None)
+CANDIDATE_EXPERTS_TO_REMOVE = os.environ.get("MIXTRAL_CANDIDATE_EXPERTS_TO_REMOVE", "0,1,2,3,4,5,6,7")
 REDUCED_EXPERT_COUNT = os.environ.get("MIXTRAL_REDUCED_EXPERT_COUNT", None)
 MERGED_MAX_LAYERS = os.environ.get("MIXTRAL_MERGED_MAX_LAYERS", 32)
 # if MIXTRAL_DISCARDED_EXPERTS is not None:
@@ -78,6 +79,9 @@ if MERGED_MAX_LAYERS is not None:
     MERGED_MAX_LAYERS = int(MERGED_MAX_LAYERS)
 if REDUCED_EXPERT_COUNT is not None:
     REDUCED_EXPERT_COUNT = int(REDUCED_EXPERT_COUNT)
+CANDIDATE_EXPERTS_TO_REMOVE = [int(x) for x in CANDIDATE_EXPERTS_TO_REMOVE.split(",")]
+if len(CANDIDATE_EXPERTS_TO_REMOVE) < (8 - REDUCED_EXPERT_COUNT):
+    raise ValueError(f"Trying to remove {8 - REDUCED_EXPERT_COUNT} experts but only {len(CANDIDATE_EXPERTS_TO_REMOVE)} experts are provided to remove.")
 
 class MixtralParallelism:
     DATA_EXPERT_PARALLEL = "data_expert_parallel"
@@ -388,6 +392,10 @@ class MixtralMoE(nn.Module):
                     # calculate total loss for merging each expert
                     loss_per_expert = []
                     for expert_id in range(self.num_total_experts):
+                        if expert_id not in CANDIDATE_EXPERTS_TO_REMOVE:
+                            # set a very high loss so they will not be selected
+                            loss_per_expert.append(torch.tensor(1e20, dtype=torch.float, device=hidden_states.device))
+                            continue
                         expert_mask = (selected_experts == expert_id)
                         expert_weight = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
                         loss = torch.linalg.norm(final_hidden_states_per_expert[expert_id] - merged_hidden_states, dim=1) * expert_weight
@@ -403,6 +411,8 @@ class MixtralMoE(nn.Module):
                             reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT-1] + [3]
                     else:
                         reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
+                    if self.layer_idx == 1:
+                        print(f"Reduced expert ids for layer {self.layer_idx} are {reduced_expert_ids}", flush=True)
                     merged_expert_ids = [x for x in range(self.num_total_experts) if x not in reduced_expert_ids]
                     merged_expert_ids_tensor = torch.tensor(merged_expert_ids, dtype=torch.long, device=hidden_states.device)
                     # reconstruct the final hidden states

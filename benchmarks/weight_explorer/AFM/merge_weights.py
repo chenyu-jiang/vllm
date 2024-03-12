@@ -33,9 +33,9 @@ def evaluate(merged_weight: torch.Tensor, weights: List[torch.Tensor], xs: List[
     return per_expert_diff_norm_mean, per_expert_diff_norm_dist, per_expert_element_wise_diff
 
 def get_output_subdir(args):
-    return f"w{args.weight_id}_l{args.layer_id}" + ("" if args.dtype == "bfloat16" else f"_{args.dtype}")
+    return f"w{args.weight_id}_l{args.layer_id}" # + ("" if args.dtype == "bfloat16" else f"_{args.dtype}")
 
-def train(weights: List[torch.Tensor], xs: List[torch.Tensor], alpha=0.9):
+def train(weights: List[torch.Tensor], xs: List[torch.Tensor], alpha=1.0):
     # compute inner products of xs
     inner_products = [x.t() @ x for x in xs]
     # reduce non-diagonal items
@@ -73,16 +73,16 @@ def main_func(args, save=True):
                     exper_id_to_params[expert_id][w_name] = param
     weights = []
     for expert_id in args.experts_to_merge:
-        weights.append(exper_id_to_params[expert_id][f"w{args.weight_id}"].to(args.device))
+        weights.append(exper_id_to_params[expert_id][f"w{args.weight_id}"].to(args.device).double())
     # load data
     data = create_dataloaders(args)
     # train
-    merged_weight = train(weights, data)
+    merged_weight = train(weights, data, alpha=args.alpha)
     # save
     if save:
         save_dir = os.path.join(args.output_dir, get_output_subdir(args))
         os.makedirs(save_dir, exist_ok=True)
-        torch.save(merged_weight, os.path.join(save_dir, "merged_weight.pt"))
+        torch.save(merged_weight.bfloat16(), os.path.join(save_dir, "merged_weight.pt"))
     # evaluate
     per_expert_diff_mean, per_expert_diff_dist, per_expert_element_wise_diff = evaluate(merged_weight, weights, data)
     for idx in range(len(args.experts_to_merge)):
@@ -111,9 +111,10 @@ def main_func(args, save=True):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--dtype", type=str, default="double")
     parser.add_argument("--weight_id", type=int, default=1)
     parser.add_argument("--experts_to_merge", type=str, default="0,1,2,3,4,5,6,7")
+    parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--layer_id", type=int, default=0)
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)

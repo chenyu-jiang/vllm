@@ -52,7 +52,7 @@ def train(weights: List[torch.Tensor], xs: List[torch.Tensor], alpha=0.9):
 
 def create_dataloaders(args):
     data_per_expert = []
-    for expert_id in range(8):
+    for expert_id in args.experts_to_merge:
         data = np.load(os.path.join(args.data_dir, f"expert_activations_e{expert_id}_l{args.layer_id}_0.npz"))["arr_0"]
         data = data.reshape(-1, 4096)
         data = torch.tensor(data, dtype=_to_torch_dtype(args.dtype), device=args.device)
@@ -72,7 +72,7 @@ def main_func(args, save=True):
                 if w_name in name:
                     exper_id_to_params[expert_id][w_name] = param
     weights = []
-    for expert_id in range(8):
+    for expert_id in args.experts_to_merge:
         weights.append(exper_id_to_params[expert_id][f"w{args.weight_id}"].to(args.device))
     # load data
     data = create_dataloaders(args)
@@ -85,26 +85,26 @@ def main_func(args, save=True):
         torch.save(merged_weight, os.path.join(save_dir, "merged_weight.pt"))
     # evaluate
     per_expert_diff_mean, per_expert_diff_dist, per_expert_element_wise_diff = evaluate(merged_weight, weights, data)
-    for expert_id in range(8):
-        print(f"Expert {expert_id} - Mean diff: {per_expert_diff_mean[expert_id]} - Element wise diff: {per_expert_element_wise_diff[expert_id]}")
+    for idx in range(len(args.experts_to_merge)):
+        print(f"Expert {args.experts_to_merge[idx]} - Mean diff: {per_expert_diff_mean[idx]} - Element wise diff: {per_expert_element_wise_diff[idx]}")
     with open(os.path.join(save_dir, "diffs.txt"), "w") as f:
-        for expert_id in range(8):
-            f.write(f"Expert {expert_id} - Mean diff: {per_expert_diff_mean[expert_id]} - Element wise diff: {per_expert_element_wise_diff[expert_id]}\n")
+        for idx in range(len(args.experts_to_merge)):
+            f.write(f"Expert {args.experts_to_merge[idx]} - Mean diff: {per_expert_diff_mean[idx]} - Element wise diff: {per_expert_element_wise_diff[idx]}\n")
     # plot histogram
-    import matplotlib.pyplot as plt
-    import pandas as pd
-    import seaborn as sns
-    experts = []
-    diffs = []
-    for expert_id in range(8):
-        experts.extend([expert_id] * len(per_expert_diff_dist[expert_id]))
-        diffs.extend(per_expert_diff_dist[expert_id])
-    df = pd.DataFrame({"Expert": experts, "Diff": diffs})
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-    for i in range(8):
-        sns.histplot(data=df[df["Expert"] == i], x="Diff", ax=axes[i // 4, i % 4])
-        axes[i // 4, i % 4].set_title(f"Expert {i}")
-    fig.savefig(os.path.join(save_dir, "histogram.pdf"), bbox_inches="tight")
+    # import matplotlib.pyplot as plt
+    # import pandas as pd
+    # import seaborn as sns
+    # experts = []
+    # diffs = []
+    # for expert_id in range(8):
+    #     experts.extend([expert_id] * len(per_expert_diff_dist[expert_id]))
+    #     diffs.extend(per_expert_diff_dist[expert_id])
+    # df = pd.DataFrame({"Expert": experts, "Diff": diffs})
+    # fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    # for i in range(8):
+    #     sns.histplot(data=df[df["Expert"] == i], x="Diff", ax=axes[i // 4, i % 4])
+    #     axes[i // 4, i % 4].set_title(f"Expert {i}")
+    # fig.savefig(os.path.join(save_dir, "histogram.pdf"), bbox_inches="tight")
 
 
 
@@ -113,6 +113,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--weight_id", type=int, default=1)
+    parser.add_argument("--experts_to_merge", type=str, default="0,1,2,3,4,5,6,7")
     parser.add_argument("--layer_id", type=int, default=0)
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
@@ -120,6 +121,8 @@ def main():
 
     assert args.weight_id == 1 or args.weight_id == 3, "Weight ID must be in {1, 3}"
     assert args.layer_id >= 0 and args.layer_id <= 31, "Layer ID must be in {0, 1, ..., 31}"
+
+    args.experts_to_merge = list(map(int, args.experts_to_merge.split(",")))
 
     fix_seed(42)
     main_func(args)

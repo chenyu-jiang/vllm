@@ -85,6 +85,7 @@ if REDUCED_EXPERT_COUNT and len(CANDIDATE_EXPERTS_TO_REMOVE) < (8 - REDUCED_EXPE
 INJECT_NOISE_STD = os.environ.get("MIXTRAL_INJECT_NOISE_STD", None)
 if INJECT_NOISE_STD is not None:
     INJECT_NOISE_STD = float(INJECT_NOISE_STD)
+INJECT_NOISE_AMP_MAP_DIR = os.environ.get("MIXTRAL_INJECT_NOISE_AMP_MAP_DIR", None)
 
 class MixtralParallelism:
     DATA_EXPERT_PARALLEL = "data_expert_parallel"
@@ -842,7 +843,19 @@ class MixtralForCausalLM(nn.Module):
                         and name not in params_dict):
                     continue
                 if ("block_sparse_moe.experts." in name) and INJECT_NOISE_STD:
-                    loaded_weight = loaded_weight + torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
+                    if INJECT_NOISE_AMP_MAP_DIR:
+                        # load noise amp map
+                        layer_id = int(name.split(".")[2])
+                        expert_id = int(name.split(".")[5])
+                        weight_id = int(name.split(".")[6][1:])
+                        noise_amp_map = torch.load(os.path.join(INJECT_NOISE_AMP_MAP_DIR, f"e{expert_id}_l{layer_id}", "weight_grad.pt"))[weight_id - 1]
+                        noise_amp_map = noise_amp_map.to(loaded_weight.device, dtype=loaded_weight.dtype)
+                        # normalize to mean = 1
+                        noise_amp_map = noise_amp_map / noise_amp_map.mean()
+                        noise_map = torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
+                        loaded_weight = loaded_weight + noise_map * noise_amp_map
+                    else:
+                        loaded_weight = loaded_weight + torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -856,7 +869,19 @@ class MixtralForCausalLM(nn.Module):
                         and name not in params_dict):
                     continue
                 if ("block_sparse_moe.experts." in name) and INJECT_NOISE_STD:
-                    loaded_weight = loaded_weight + torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
+                    if INJECT_NOISE_AMP_MAP_DIR:
+                        # load noise amp map
+                        layer_id = int(name.split(".")[2])
+                        expert_id = int(name.split(".")[5])
+                        weight_id = int(name.split(".")[6][1:])
+                        noise_amp_map = torch.load(os.path.join(INJECT_NOISE_AMP_MAP_DIR, f"e{expert_id}_l{layer_id}", "weight_grad.pt"))[weight_id - 1]
+                        noise_amp_map = noise_amp_map.to(loaded_weight.device, dtype=loaded_weight.dtype)
+                        # normalize to mean = 1
+                        noise_amp_map = noise_amp_map / noise_amp_map.mean()
+                        noise_map = torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
+                        loaded_weight = loaded_weight + noise_map * noise_amp_map
+                    else:
+                        loaded_weight = loaded_weight + torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)

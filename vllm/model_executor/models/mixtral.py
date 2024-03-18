@@ -66,10 +66,10 @@ from vllm.sequence import SamplerOutput
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
-NO_MERGED = os.environ.get("MIXTRAL_NO_MERGED", None)
 MERGED_DIR = os.environ.get("MIXTRAL_MERGED_DIR", None)
 PREDICTOR_DIR = os.environ.get("MIXTRAL_PREDICTOR_DIR", None)
 # MIXTRAL_DISCARDED_EXPERTS = os.environ.get("MIXTRAL_DISCARDED_EXPERTS", None)
+CANDIDATE_EXPERTS_TO_REMOVE = os.environ.get("MIXTRAL_CANDIDATE_EXPERTS_TO_REMOVE", "0,1,2,3,4,5,6,7")
 REDUCED_EXPERT_COUNT = os.environ.get("MIXTRAL_REDUCED_EXPERT_COUNT", None)
 MERGED_MAX_LAYERS = os.environ.get("MIXTRAL_MERGED_MAX_LAYERS", 32)
 # if MIXTRAL_DISCARDED_EXPERTS is not None:
@@ -78,6 +78,13 @@ if MERGED_MAX_LAYERS is not None:
     MERGED_MAX_LAYERS = int(MERGED_MAX_LAYERS)
 if REDUCED_EXPERT_COUNT is not None:
     REDUCED_EXPERT_COUNT = int(REDUCED_EXPERT_COUNT)
+CANDIDATE_EXPERTS_TO_REMOVE = [int(x) for x in CANDIDATE_EXPERTS_TO_REMOVE.split(",")]
+if REDUCED_EXPERT_COUNT and len(CANDIDATE_EXPERTS_TO_REMOVE) < (8 - REDUCED_EXPERT_COUNT):
+    raise ValueError(f"Trying to remove {8 - REDUCED_EXPERT_COUNT} experts but only {len(CANDIDATE_EXPERTS_TO_REMOVE)} experts are provided to remove.")
+
+INJECT_NOISE_STD = os.environ.get("MIXTRAL_INJECT_NOISE_STD", None)
+if INJECT_NOISE_STD is not None:
+    INJECT_NOISE_STD = float(INJECT_NOISE_STD)
 
 class MixtralParallelism:
     DATA_EXPERT_PARALLEL = "data_expert_parallel"
@@ -338,7 +345,7 @@ class MixtralMoE(nn.Module):
             for idx in range(self.num_total_experts)
         ])
         self.merged_expert = None
-        if self.tp_rank == 7:
+        if self.tp_rank == 7 and MERGED_DIR:
             self.merged_expert = mixtral_mlp(self.num_total_experts,
                                                 config.hidden_size,
                                                 config.intermediate_size,
@@ -381,7 +388,7 @@ class MixtralMoE(nn.Module):
 
 
         if self.parallel_method == MixtralParallelism.TENSOR_EXPERT_PARALLEL:
-            if not is_decode or self.layer_idx >= MERGED_MAX_LAYERS:
+            if not is_decode or self.layer_idx >= MERGED_MAX_LAYERS or not MERGED_DIR:
                 final_hidden_states = None
                 for expert_idx in self.expert_indicies:
 
@@ -415,44 +422,30 @@ class MixtralMoE(nn.Module):
                 if self.tp_rank == 7:
                     merged_expert_layer = self.merged_expert
                     merged_hidden_states = merged_expert_layer(hidden_states)
-                    # calculate importance score of each token
-                    # logp = torch.log(routing_weights_full + 1e-20)
-                    # entropy = -torch.sum(routing_weights_full * logp, dim=1)
-                    # select top k tokens with the lowest entropy until REDUCED_EXPERT_COUNT expert is selected
-                    top_sample_ids = torch.argsort(routing_weights[:,0], descending=True)
-                    reduced_expert_ids = []
-                    for token_id in top_sample_ids:
-                        selected_experts_per_token = selected_experts[token_id].tolist()
-                        for e in selected_experts_per_token[:1]:
-                            if e not in reduced_expert_ids:
-                                reduced_expert_ids.append(e)
-                                if len(reduced_expert_ids) == REDUCED_EXPERT_COUNT:
-                                    break
-                        if len(reduced_expert_ids) == REDUCED_EXPERT_COUNT:
-                            break
                     # calculate total loss for merging each expert
-                    # loss_per_expert = []
-                    # for expert_id in range(self.num_total_experts):
-                    #     expert_mask = (selected_experts == expert_id)
-                    #     expert_weight = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
-                    #     norm = torch.linalg.norm(final_hidden_states_per_expert[expert_id] - merged_hidden_states, dim=1, keepdim=True)
-                    #     loss = norm * expert_weight
-                    #     loss_per_expert.append(loss.sum())
-                    #     # loss_per_expert.append(loss)
-                    # loss_per_expert = torch.stack(loss_per_expert, dim=0)
-                    # # select experts with the highest loss to preserve
-                    # reduced_expert_ids = torch.argsort(loss_per_expert, dim=0, descending=True)
-                    # reduced_expert_ids = reduced_expert_ids.tolist()
-                    # if self.layer_idx == 1:
-                    #     if 3 in reduced_expert_ids[:REDUCED_EXPERT_COUNT]:
-                    #         reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
-                    #     else:
-                    #         reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT-1] + [3]
-                    # else:
-                    #     reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
-                    # reduced_expert_ids = solve_min_max_token_loss(routing_weights, selected_experts, loss_per_expert, REDUCED_EXPERT_COUNT)
+                    loss_per_expert = []
+                    for expert_id in range(self.num_total_experts):
+                        if expert_id not in CANDIDATE_EXPERTS_TO_REMOVE:
+                            # set a very high loss so they will not be selected
+                            loss_per_expert.append(torch.tensor(1e20, dtype=torch.float, device=hidden_states.device))
+                            continue
+                        expert_mask = (selected_experts == expert_id)
+                        expert_weight = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
+                        loss = torch.linalg.norm(final_hidden_states_per_expert[expert_id] - merged_hidden_states, dim=1) * expert_weight
+                        loss_per_expert.append(loss.sum())
+                    loss_per_expert = torch.stack(loss_per_expert, dim=0)
+                    # select experts with the highest loss to preserve
+                    reduced_expert_ids = torch.argsort(loss_per_expert, dim=0, descending=True)
+                    reduced_expert_ids = reduced_expert_ids.tolist()
                     if self.layer_idx == 1:
-                        print(f"Reduced experts for layer {self.layer_idx} are {reduced_expert_ids}", flush=True)
+                        if 3 in reduced_expert_ids[:REDUCED_EXPERT_COUNT]:
+                            reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
+                        else:
+                            reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT-1] + [3]
+                    else:
+                        reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
+                    if self.layer_idx == 1:
+                        print(f"Reduced expert ids for layer {self.layer_idx} are {reduced_expert_ids}", flush=True)
                     merged_expert_ids = [x for x in range(self.num_total_experts) if x not in reduced_expert_ids]
                     merged_expert_ids_tensor = torch.tensor(merged_expert_ids, dtype=torch.long, device=hidden_states.device)
                     # reconstruct the final hidden states
@@ -848,6 +841,8 @@ class MixtralForCausalLM(nn.Module):
                 if ("block_sparse_moe.experts." in name
                         and name not in params_dict):
                     continue
+                if ("block_sparse_moe.experts." in name) and INJECT_NOISE_STD:
+                    loaded_weight = loaded_weight + torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -860,6 +855,8 @@ class MixtralForCausalLM(nn.Module):
                 if ("block_sparse_moe.experts." in name
                         and name not in params_dict):
                     continue
+                if ("block_sparse_moe.experts." in name) and INJECT_NOISE_STD:
+                    loaded_weight = loaded_weight + torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)

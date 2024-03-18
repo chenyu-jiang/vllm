@@ -75,9 +75,9 @@ def main_func(args, save=True):
     w3_weights = []
     weights = []
     for expert_id in args.experts_to_merge:
-        weights.append(exper_id_to_params[expert_id][f"w2"].to(args.device).double())
-        w1_weights.append(exper_id_to_params[expert_id][f"w1"].to(args.device).double())
-        w3_weights.append(exper_id_to_params[expert_id][f"w3"].to(args.device).double())
+        weights.append(exper_id_to_params[expert_id][f"w2"].to(args.device).bfloat16())
+        w1_weights.append(exper_id_to_params[expert_id][f"w1"].to(args.device).bfloat16())
+        w3_weights.append(exper_id_to_params[expert_id][f"w3"].to(args.device).bfloat16())
     # load data
     data = create_dataloaders(args)
     # project data using w1 and w3
@@ -120,7 +120,7 @@ def main_func(args, save=True):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--dtype", type=str, default="double")
+    parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--weight_id", type=int, default=2)
     parser.add_argument("--experts_to_merge", type=str, default="0,1,2,3,4,5,6,7")
     parser.add_argument("--alpha", type=float, default=1.0)

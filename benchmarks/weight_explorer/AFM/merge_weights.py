@@ -73,7 +73,7 @@ def main_func(args, save=True):
                     exper_id_to_params[expert_id][w_name] = param
     weights = []
     for expert_id in args.experts_to_merge:
-        weights.append(exper_id_to_params[expert_id][f"w{args.weight_id}"].to(args.device).double())
+        weights.append(exper_id_to_params[expert_id][f"w{args.weight_id}"].to(args.device).float())
     # load data
     data = create_dataloaders(args)
     # train
@@ -111,7 +111,7 @@ def main_func(args, save=True):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--dtype", type=str, default="double")
+    parser.add_argument("--dtype", type=str, default="float")
     parser.add_argument("--weight_id", type=int, default=1)
     parser.add_argument("--experts_to_merge", type=str, default="0,1,2,3,4,5,6,7")
     parser.add_argument("--alpha", type=float, default=1.0)

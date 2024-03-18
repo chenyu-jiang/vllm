@@ -850,6 +850,7 @@ class MixtralForCausalLM(nn.Module):
                         weight_id = int(name.split(".")[6][1:])
                         noise_amp_map = torch.load(os.path.join(INJECT_NOISE_AMP_MAP_DIR, f"e{expert_id}_l{layer_id}", "weight_grad.pt"))[weight_id - 1]
                         noise_amp_map = noise_amp_map.to(loaded_weight.device, dtype=loaded_weight.dtype)
+                        noise_amp_map = torch.abs(noise_amp_map)
                         # normalize to mean = 1
                         noise_amp_map = noise_amp_map / noise_amp_map.mean()
                         noise_map = torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)

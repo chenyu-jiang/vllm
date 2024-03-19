@@ -86,6 +86,9 @@ INJECT_NOISE_STD = os.environ.get("MIXTRAL_INJECT_NOISE_STD", None)
 if INJECT_NOISE_STD is not None:
     INJECT_NOISE_STD = float(INJECT_NOISE_STD)
 INJECT_NOISE_AMP_MAP_DIR = os.environ.get("MIXTRAL_INJECT_NOISE_AMP_MAP_DIR", None)
+INJECT_NOISE_TYPE = os.environ.get("MIXTRAL_INJECT_NOISE_TYPE", "Gaussian")
+if INJECT_NOISE_TYPE not in ["Gaussian", "Uniform"]:
+    raise ValueError(f"Invalid noise type {INJECT_NOISE_TYPE}")
 
 class MixtralParallelism:
     DATA_EXPERT_PARALLEL = "data_expert_parallel"
@@ -849,14 +852,26 @@ class MixtralForCausalLM(nn.Module):
                         expert_id = int(name.split(".")[5])
                         weight_id = int(name.split(".")[6][1:])
                         noise_amp_map = torch.load(os.path.join(INJECT_NOISE_AMP_MAP_DIR, f"e{expert_id}_l{layer_id}", "weight_grad.pt"))[weight_id - 1]
-                        noise_amp_map = noise_amp_map.to(loaded_weight.device, dtype=loaded_weight.dtype)
+                        noise_amp_map = noise_amp_map.to(device="cuda", dtype=loaded_weight.dtype)
+                        loaded_weight = loaded_weight.cuda()
                         noise_amp_map = torch.abs(noise_amp_map)
+                        # invert the noise amp map
+                        noise_amp_map = noise_amp_map.max() - noise_amp_map
                         # normalize to mean = 1
                         noise_amp_map = noise_amp_map / noise_amp_map.mean()
-                        noise_map = torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
+                        if INJECT_NOISE_TYPE == "Gaussian":
+                            noise_map = torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
+                        else:
+                            noise_map = torch.zeros_like(loaded_weight).uniform_(-INJECT_NOISE_STD, INJECT_NOISE_STD)
                         loaded_weight = loaded_weight + noise_map * noise_amp_map
+                        loaded_weight = loaded_weight.cpu()
+                        del noise_amp_map
+                        del noise_map
                     else:
-                        loaded_weight = loaded_weight + torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
+                        if INJECT_NOISE_TYPE == "Gaussian":
+                            loaded_weight = loaded_weight + torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
+                        else:
+                            loaded_weight = loaded_weight + torch.zeros_like(loaded_weight).uniform_(-INJECT_NOISE_STD, INJECT_NOISE_STD)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -876,13 +891,26 @@ class MixtralForCausalLM(nn.Module):
                         expert_id = int(name.split(".")[5])
                         weight_id = int(name.split(".")[6][1:])
                         noise_amp_map = torch.load(os.path.join(INJECT_NOISE_AMP_MAP_DIR, f"e{expert_id}_l{layer_id}", "weight_grad.pt"))[weight_id - 1]
-                        noise_amp_map = noise_amp_map.to(loaded_weight.device, dtype=loaded_weight.dtype)
+                        noise_amp_map = noise_amp_map.to(device="cuda", dtype=loaded_weight.dtype)
+                        loaded_weight = loaded_weight.cuda()
+                        noise_amp_map = torch.abs(noise_amp_map)
+                        # invert the noise amp map
+                        noise_amp_map = noise_amp_map.max() - noise_amp_map
                         # normalize to mean = 1
                         noise_amp_map = noise_amp_map / noise_amp_map.mean()
-                        noise_map = torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
+                        if INJECT_NOISE_TYPE == "Gaussian":
+                            noise_map = torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
+                        else:
+                            noise_map = torch.zeros_like(loaded_weight).uniform_(-INJECT_NOISE_STD, INJECT_NOISE_STD)
                         loaded_weight = loaded_weight + noise_map * noise_amp_map
+                        loaded_weight = loaded_weight.cpu()
+                        del noise_amp_map
+                        del noise_map
                     else:
-                        loaded_weight = loaded_weight + torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
+                        if INJECT_NOISE_TYPE == "Gaussian":
+                            loaded_weight = loaded_weight + torch.normal(mean=0.0, std=INJECT_NOISE_STD, size=loaded_weight.shape, device=loaded_weight.device)
+                        else:
+                            loaded_weight = loaded_weight + torch.zeros_like(loaded_weight).uniform_(-INJECT_NOISE_STD, INJECT_NOISE_STD)
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)

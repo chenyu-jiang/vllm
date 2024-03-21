@@ -64,6 +64,8 @@ from vllm.model_executor.weight_utils import (default_weight_loader,
                                               hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
 
+import itertools
+
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 MERGED_DIR = os.environ.get("MIXTRAL_MERGED_DIR", None)
@@ -82,6 +84,32 @@ CANDIDATE_EXPERTS_TO_REMOVE = [int(x) for x in CANDIDATE_EXPERTS_TO_REMOVE.split
 if REDUCED_EXPERT_COUNT and len(CANDIDATE_EXPERTS_TO_REMOVE) < (8 - REDUCED_EXPERT_COUNT):
     raise ValueError(f"Trying to remove {8 - REDUCED_EXPERT_COUNT} experts but only {len(CANDIDATE_EXPERTS_TO_REMOVE)} experts are provided to remove.")
 
+REROUTE_MAP = os.environ.get("MIXTRAL_REROUTE_MAP", None)
+REROUTE_MAP_DICT = None
+if REROUTE_MAP is not None:
+    REROUTE_MAP_DICT = {}
+    split_reroute_map = REROUTE_MAP.split(",")
+    assert len(split_reroute_map) == 32, "REROUTE_MAP must have 32 entries"
+    for layer_id in range(32):
+        REROUTE_MAP_DICT[layer_id] = {}
+        src_expert_id, dst_expert_id = split_reroute_map[layer_id].split(":")
+        REROUTE_MAP_DICT[layer_id][int(src_expert_id)] = int(dst_expert_id)
+REROUTE_THRESHOLD = os.environ.get("MIXTRAL_REROUTE_THRESHOLD", 1.0)
+if REROUTE_THRESHOLD is not None:
+    REROUTE_THRESHOLD = float(REROUTE_THRESHOLD)
+REROUTE_OPTIMAL = os.environ.get("MIXTRAL_REROUTE_OPTIMAL", False)
+if REROUTE_OPTIMAL is not None:
+    REROUTE_OPTIMAL = bool(REROUTE_OPTIMAL)
+REROUTE_OPTIMAL_THRESHOLD = os.environ.get("MIXTRAL_REROUTE_OPTIMAL_THRESHOLD", 1e-4)
+if REROUTE_OPTIMAL_THRESHOLD is not None:
+    REROUTE_OPTIMAL_THRESHOLD = float(REROUTE_OPTIMAL_THRESHOLD)
+REROUTE_OPTIMAL_K = os.environ.get("MIXTRAL_REROUTE_OPTIMAL_K", 1)
+if REROUTE_OPTIMAL_K is not None:
+    REROUTE_OPTIMAL_K = int(REROUTE_OPTIMAL_K)
+REROUTE_GRANULARITY = os.environ.get("MIXTRAL_REROUTE_GRANULARITY", "Expert")
+if REROUTE_GRANULARITY not in ["Expert", "Token"]:
+    raise ValueError(f"Invalid reroute granularity {REROUTE_GRANULARITY}")
+
 INJECT_NOISE_STD = os.environ.get("MIXTRAL_INJECT_NOISE_STD", None)
 if INJECT_NOISE_STD is not None:
     INJECT_NOISE_STD = float(INJECT_NOISE_STD)
@@ -89,6 +117,7 @@ INJECT_NOISE_AMP_MAP_DIR = os.environ.get("MIXTRAL_INJECT_NOISE_AMP_MAP_DIR", No
 INJECT_NOISE_TYPE = os.environ.get("MIXTRAL_INJECT_NOISE_TYPE", "Gaussian")
 if INJECT_NOISE_TYPE not in ["Gaussian", "Uniform"]:
     raise ValueError(f"Invalid noise type {INJECT_NOISE_TYPE}")
+INJECT_NOISE_AMP_MAP_TYPE = os.environ.get("MIXTRAL_INJECT_NOISE_AMP_MAP_TYPE", "Gradient")
 
 class MixtralParallelism:
     DATA_EXPERT_PARALLEL = "data_expert_parallel"
@@ -349,7 +378,7 @@ class MixtralMoE(nn.Module):
             for idx in range(self.num_total_experts)
         ])
         self.merged_expert = None
-        if self.tp_rank == 7 and MERGED_DIR:
+        if self.tp_rank == self.tp_size - 1 and MERGED_DIR:
             self.merged_expert = mixtral_mlp(self.num_total_experts,
                                                 config.hidden_size,
                                                 config.intermediate_size,
@@ -390,6 +419,87 @@ class MixtralMoE(nn.Module):
             print("Error in MixtralMoE forward", e, flush=True)
             raise e
 
+        if REROUTE_MAP_DICT and is_decode:
+            src_expert_id, dst_expert_id = list(REROUTE_MAP_DICT[self.layer_idx].items())[0]
+            reroute_mask = routing_weights[:, 0] < REROUTE_THRESHOLD
+            reroute_mask = torch.unsqueeze(reroute_mask, dim=-1).expand_as(routing_weights)
+            matching_tokens = (selected_experts == src_expert_id)
+            total_matching_token_count = matching_tokens.sum().item()
+            ignored_token = matching_tokens.sum().item() - (reroute_mask & matching_tokens).sum().item()
+            print("In Layer {}, ignored {}/{} (bs: {}) tokens due to exceeding threshold".format(self.layer_idx, ignored_token, total_matching_token_count, hidden_states.shape[0]), flush=True)
+
+            selected_experts_masked = selected_experts.clone()
+            selected_experts_masked[selected_experts_masked == src_expert_id] = dst_expert_id
+            selected_experts = selected_experts_masked * reroute_mask + selected_experts * ~reroute_mask
+
+        if REROUTE_OPTIMAL:
+            # first we calculate the actual hidden states per expert
+            final_hidden_states_per_expert = []
+            for expert_idx in range(self.num_total_experts):
+                expert_hidden_states = None
+                if expert_idx in self.expert_indicies:
+                    expert_layer = self.experts[expert_idx]
+                    expert_hidden_states = expert_layer(hidden_states)
+                if expert_hidden_states is None:
+                    expert_hidden_states = torch.zeros_like(hidden_states)
+                expert_hidden_states = tensor_model_parallel_all_reduce(expert_hidden_states)
+                final_hidden_states_per_expert.append(expert_hidden_states)
+
+            # then on rank 7, we calculate losses
+            if self.tp_rank == self.tp_size - 1:
+                loss_dict = {}
+                for expert_1 in range(self.num_total_experts):
+                    for expert_2 in range(self.num_total_experts):
+                        if expert_1 == expert_2:
+                            continue
+                        loss = torch.linalg.norm(final_hidden_states_per_expert[expert_1] - final_hidden_states_per_expert[expert_2], dim=1)
+                        loss_dict[(expert_1, expert_2)] = loss
+                # then we calculate the optimal expert selection
+                # for each layer, we select k expert to reroute
+                results = []
+                if REROUTE_GRANULARITY == "Token":
+                    # we enumerate over all possible dropped experts
+                    for from_experts in itertools.combinations(range(self.num_total_experts), REROUTE_OPTIMAL_K):
+                        from_expert_tensor = torch.tensor(from_experts, dtype=torch.long, device=hidden_states.device)
+                        to_experts = set(range(self.num_total_experts)) - set(from_experts)
+                        reroute_mask = (routing_weights[:, 0] < REROUTE_OPTIMAL_THRESHOLD).unsqueeze(-1).expand_as(selected_experts) & (selected_experts.isin(from_experts))
+                        # calculate loss
+                    pass
+                else:
+                    for from_expert in range(self.num_total_experts):
+                        for to_expert in range(self.num_total_experts):
+                            if from_expert == to_expert:
+                                continue
+                            # loss if we reroute from_expert to to_expert
+                            loss = loss_dict[(from_expert, to_expert)]
+                            reroute_mask = (routing_weights[:, 0] < REROUTE_THRESHOLD).unsqueeze(-1).expand_as(selected_experts) & (selected_experts == from_expert)
+                            reroute_mask_float = reroute_mask.float().sum(dim=-1, keepdim=True)
+                            reroute_loss = (loss * reroute_mask_float).sum()
+                            results.append((reroute_loss, (from_expert, to_expert)))
+                    # sort the results and select top k
+                    results = sorted(results, key=lambda x: x[0])
+                    top_k_results = []
+                    experts_to_remove = set()
+                    experts_to_retain = set()
+                    for _ in range(REROUTE_OPTIMAL_K):
+                        for r in results:
+                            if r[1][0] not in experts_to_remove and r[1][0] not in experts_to_retain and r[1][1] not in experts_to_remove:
+                                top_k_results.append(r)
+                                experts_to_remove.add(r[1][0])
+                                experts_to_retain.add(r[1][1])
+                                break
+                    # print(f"Optimal expert selection for layer {self.layer_idx} is {[x[1] for x in top_k_results]}", flush=True)
+                    optimal_selected_expert = selected_experts.clone()
+                    for _, (from_expert, to_expert) in top_k_results:
+                        optimal_selected_expert[optimal_selected_expert == from_expert] = to_expert
+                reroute_mask = (routing_weights[:, 0] < REROUTE_THRESHOLD).unsqueeze(-1).expand_as(selected_experts)
+                selected_experts = optimal_selected_expert * reroute_mask + selected_experts * ~reroute_mask
+                # broadcast the selected experts
+                selected_experts = tensor_model_parallel_all_reduce(selected_experts)
+            else:
+                selected_experts = torch.zeros_like(selected_experts)
+                selected_experts = tensor_model_parallel_all_reduce(selected_experts)
+
 
         if self.parallel_method == MixtralParallelism.TENSOR_EXPERT_PARALLEL:
             if not is_decode or self.layer_idx >= MERGED_MAX_LAYERS or not MERGED_DIR:
@@ -423,9 +533,14 @@ class MixtralMoE(nn.Module):
                     final_hidden_states_per_expert.append(expert_hidden_states)
 
                 # then on rank 7, we calculate the merged hidden states
-                if self.tp_rank == 7:
+                if self.tp_rank == self.tp_size - 1:
                     merged_expert_layer = self.merged_expert
-                    merged_hidden_states = merged_expert_layer(hidden_states)
+                    hidden_states_cpu = hidden_states.cpu()
+                    merged_hidden_states = merged_expert_layer(hidden_states_cpu)
+                    merged_hidden_states = merged_hidden_states.cuda()
+                    # don't reroute experts whose top 1 weight >=0.8
+                    reroute_mask = routing_weights[:, 0] < 0.8
+                    reroute_mask = torch.unsqueeze(reroute_mask, dim=-1).expand_as(routing_weights)
                     # calculate total loss for merging each expert
                     loss_per_expert = []
                     for expert_id in range(self.num_total_experts):
@@ -433,7 +548,7 @@ class MixtralMoE(nn.Module):
                             # set a very high loss so they will not be selected
                             loss_per_expert.append(torch.tensor(1e20, dtype=torch.float, device=hidden_states.device))
                             continue
-                        expert_mask = (selected_experts == expert_id)
+                        expert_mask = (selected_experts == expert_id) & reroute_mask
                         expert_weight = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
                         loss = torch.linalg.norm(final_hidden_states_per_expert[expert_id] - merged_hidden_states, dim=1) * expert_weight
                         loss_per_expert.append(loss.sum())
@@ -448,20 +563,25 @@ class MixtralMoE(nn.Module):
                             reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT-1] + [3]
                     else:
                         reduced_expert_ids = reduced_expert_ids[:REDUCED_EXPERT_COUNT]
-                    if self.layer_idx == 1:
-                        print(f"Reduced expert ids for layer {self.layer_idx} are {reduced_expert_ids}", flush=True)
+                    # if self.layer_idx == 1:
+                    #     print(f"Reduced expert ids for layer {self.layer_idx} are {reduced_expert_ids}", flush=True)
                     merged_expert_ids = [x for x in range(self.num_total_experts) if x not in reduced_expert_ids]
                     merged_expert_ids_tensor = torch.tensor(merged_expert_ids, dtype=torch.long, device=hidden_states.device)
                     # reconstruct the final hidden states
                     final_hidden_states = torch.zeros_like(hidden_states)
                     for expert_id in reduced_expert_ids:
-                        expert_mask = (selected_experts == expert_id)
+                        expert_mask = (selected_experts == expert_id) & reroute_mask
                         expert_weight = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
                         final_hidden_states.add_(final_hidden_states_per_expert[expert_id] * expert_weight)
                     # add the merged expert
                     expert_mask = torch.isin(selected_experts, merged_expert_ids_tensor)
                     expert_weight = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
                     final_hidden_states.add_(merged_hidden_states * expert_weight)
+                    # add masked expert
+                    for expert_id in range(self.num_total_experts):
+                        expert_mask = (selected_experts == expert_id) & ~reroute_mask
+                        expert_weight = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
+                        final_hidden_states.add_(final_hidden_states_per_expert[expert_id] * expert_weight)
                     return tensor_model_parallel_all_reduce(final_hidden_states).view(
                         batch_size, sequence_length, hidden_dim)
                 else:
@@ -746,7 +866,7 @@ class MixtralModel(nn.Module):
             for layer_idx, layer in enumerate(self.layers):
                 if layer_idx >= MERGED_MAX_LAYERS:
                     continue
-                if get_tensor_model_parallel_rank() == 7:
+                if get_tensor_model_parallel_rank() == get_tensor_model_parallel_world_size() - 1:
                     expert_layer = layer.block_sparse_moe.merged_expert
                     print(f"Loading merged expert weight for layer {layer_idx}.", flush=True)
                     state_dicts = {}
@@ -767,6 +887,7 @@ class MixtralModel(nn.Module):
                     if expert_layer.w2.weight.data.shape != state_dicts["w2"].shape:
                         state_dicts["w2"] = state_dicts["w2"].t()
                     expert_layer.w2.weight.data.copy_(state_dicts["w2"])
+                    expert_layer.to("cpu")
         except Exception as e:
             print("Error in loading MLP weight", e, flush=True)
             raise e
@@ -851,7 +972,15 @@ class MixtralForCausalLM(nn.Module):
                         layer_id = int(name.split(".")[2])
                         expert_id = int(name.split(".")[5])
                         weight_id = int(name.split(".")[6][1:])
-                        noise_amp_map = torch.load(os.path.join(INJECT_NOISE_AMP_MAP_DIR, f"e{expert_id}_l{layer_id}", "weight_grad.pt"))[weight_id - 1]
+                        if INJECT_NOISE_AMP_MAP_TYPE == "Gradient":
+                            noise_amp_map = torch.load(os.path.join(INJECT_NOISE_AMP_MAP_DIR, f"e{expert_id}_l{layer_id}", "weight_grad.pt"))[weight_id - 1]
+                        else:
+                            noise_amp_map = torch.load(os.path.join(INJECT_NOISE_AMP_MAP_DIR, f"e{expert_id}_l{layer_id}", "weight_hessian.pt"))
+                            if weight_id == 1 or weight_id == 3:
+                                noise_amp_map = noise_amp_map[0]
+                            else:
+                                noise_amp_map = noise_amp_map[1]
+                            noise_amp_map = noise_amp_map.expand_as(loaded_weight)
                         noise_amp_map = noise_amp_map.to(device="cuda", dtype=loaded_weight.dtype)
                         loaded_weight = loaded_weight.cuda()
                         noise_amp_map = torch.abs(noise_amp_map)
@@ -890,7 +1019,15 @@ class MixtralForCausalLM(nn.Module):
                         layer_id = int(name.split(".")[2])
                         expert_id = int(name.split(".")[5])
                         weight_id = int(name.split(".")[6][1:])
-                        noise_amp_map = torch.load(os.path.join(INJECT_NOISE_AMP_MAP_DIR, f"e{expert_id}_l{layer_id}", "weight_grad.pt"))[weight_id - 1]
+                        if INJECT_NOISE_AMP_MAP_TYPE == "Gradient":
+                            noise_amp_map = torch.load(os.path.join(INJECT_NOISE_AMP_MAP_DIR, f"e{expert_id}_l{layer_id}", "weight_grad.pt"))[weight_id - 1]
+                        else:
+                            noise_amp_map = torch.load(os.path.join(INJECT_NOISE_AMP_MAP_DIR, f"e{expert_id}_l{layer_id}", "weight_hessian.pt"))
+                            if weight_id == 1 or weight_id == 3:
+                                noise_amp_map = noise_amp_map[0]
+                            else:
+                                noise_amp_map = noise_amp_map[1]
+                            noise_amp_map = noise_amp_map.expand_as(loaded_weight)
                         noise_amp_map = noise_amp_map.to(device="cuda", dtype=loaded_weight.dtype)
                         loaded_weight = loaded_weight.cuda()
                         noise_amp_map = torch.abs(noise_amp_map)

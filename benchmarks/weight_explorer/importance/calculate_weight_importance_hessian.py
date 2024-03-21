@@ -51,11 +51,11 @@ def main_func(args):
     # load data
     data = create_dataloaders(args)
     # calc w1/w3 hessian
-    H_w1 = 2 * data.t() @ data
+    H_w1 = torch.diagonal(2 * data.t() @ data)
     # get w2 input
     w1, w3 = weights[0], weights[2]
     w2_input = get_w2_input(w1.t(), w3.t(), data)
-    H_w2 = 2 * w2_input.t() @ w2_input
+    H_w2 = torch.diagonal(2 * w2_input.t() @ w2_input)
 
     torch.save((H_w1, H_w2), os.path.join(args.output_dir, get_output_subdir(args), "weight_hessian.pt"))
 

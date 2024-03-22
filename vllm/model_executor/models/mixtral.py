@@ -100,9 +100,6 @@ if REROUTE_THRESHOLD is not None:
 REROUTE_OPTIMAL = os.environ.get("MIXTRAL_REROUTE_OPTIMAL", False)
 if REROUTE_OPTIMAL is not None:
     REROUTE_OPTIMAL = bool(REROUTE_OPTIMAL)
-REROUTE_OPTIMAL_THRESHOLD = os.environ.get("MIXTRAL_REROUTE_OPTIMAL_THRESHOLD", 1e-4)
-if REROUTE_OPTIMAL_THRESHOLD is not None:
-    REROUTE_OPTIMAL_THRESHOLD = float(REROUTE_OPTIMAL_THRESHOLD)
 REROUTE_OPTIMAL_K = os.environ.get("MIXTRAL_REROUTE_OPTIMAL_K", 1)
 if REROUTE_OPTIMAL_K is not None:
     REROUTE_OPTIMAL_K = int(REROUTE_OPTIMAL_K)
@@ -433,107 +430,122 @@ class MixtralMoE(nn.Module):
             selected_experts = selected_experts_masked * reroute_mask + selected_experts * ~reroute_mask
 
         if REROUTE_OPTIMAL:
-            # first we calculate the actual hidden states per expert
-            final_hidden_states_per_expert = []
-            for expert_idx in range(self.num_total_experts):
-                expert_hidden_states = None
-                if expert_idx in self.expert_indicies:
-                    expert_layer = self.experts[expert_idx]
-                    expert_hidden_states = expert_layer(hidden_states)
-                if expert_hidden_states is None:
-                    expert_hidden_states = torch.zeros_like(hidden_states)
-                expert_hidden_states = tensor_model_parallel_all_reduce(expert_hidden_states)
-                final_hidden_states_per_expert.append(expert_hidden_states)
+            try:
+                # first we calculate the actual hidden states per expert
+                final_hidden_states_per_expert = []
+                for expert_idx in range(self.num_total_experts):
+                    expert_hidden_states = None
+                    if expert_idx in self.expert_indicies:
+                        expert_layer = self.experts[expert_idx]
+                        expert_hidden_states = expert_layer(hidden_states)
+                    if expert_hidden_states is None:
+                        expert_hidden_states = torch.zeros_like(hidden_states)
+                    expert_hidden_states = tensor_model_parallel_all_reduce(expert_hidden_states)
+                    final_hidden_states_per_expert.append(expert_hidden_states)
 
-            # then on rank 7, we calculate losses
-            if self.tp_rank == self.tp_size - 1:
-                # then we calculate the optimal expert selection
-                # for each layer, we select k expert to reroute
-                results = []
-                if REROUTE_GRANULARITY == "Token":
-                    min_loss_achieved = 1e20
-                    # optimal_from_experts = None
-                    optimal_to_experts = None
-                    optimal_min_loss_expert_map = None
-                    optimal_reroute_mask = None
-                    # first get the ground truth output for all tokens
-                    ground_truth_output = torch.zeros((expert_outputs[0].shape[0], selected_experts.shape[1], expert_outputs[0].shape[1]), dtype=expert_outputs[0].dtype, device=expert_outputs[0].device)
-                    for expert_id in range(8):
-                        expert_mask = (selected_experts == expert_id)
-                        expert_weight = (routing_weights * expert_mask)
-                        ground_truth_output += final_hidden_states_per_expert[expert_id].unsqueeze(1).expand(-1, selected_experts.shape[1], -1) * expert_weight.unsqueeze(-1)
-                    # we enumerate over all possible dropped experts
-                    for from_experts in itertools.combinations(range(self.num_total_experts), REROUTE_OPTIMAL_K):
-                        from_expert_tensor = torch.tensor(from_experts, dtype=torch.long, device=hidden_states.device)
-                        to_experts = sorted(list(set(range(self.num_total_experts)) - set(from_experts)))
-                        reroute_mask = (routing_weights[:, 0] < REROUTE_OPTIMAL_THRESHOLD).unsqueeze(-1).expand_as(selected_experts) & (torch.isin(selected_experts, from_expert_tensor))
-                        # calculate loss: each token matching the reroute mask
-                        # has min loss across all to_experts
-                        to_experts_losses_per_token = []
-                        # first assume it is routed to nothing, i.e. zeros
-                        route_to_zero_loss = torch.linalg.norm((ground_truth_output * reroute_mask.unsqueeze(-1)), dim=-1)
-                        to_experts_losses_per_token.append(route_to_zero_loss)
-                        for to_expert in to_experts:
-                            output = final_hidden_states_per_expert[to_expert].unsqueeze(1).expand(-1, selected_experts.shape[1], -1) * routing_weights.unsqueeze(-1)
-                            to_expert_loss = torch.linalg.norm((ground_truth_output - output) * reroute_mask.unsqueeze(-1), dim=-1)
-                            to_experts_losses_per_token.append(to_expert_loss)
-                        to_experts_losses_per_token = torch.stack(to_experts_losses_per_token, dim=0) # [to_expert, batch, 2]
-                        # find argmin in to_experts dimension
-                        min_loss_expert = torch.argmin(to_experts_losses_per_token, dim=0) # [batch, 2]
-                        min_loss = torch.min(to_experts_losses_per_token, dim=0)[0].sum().item()
-                        if min_loss < min_loss_achieved:
-                            min_loss_achieved = min_loss
-                            # optimal_from_experts = from_experts
-                            optimal_to_experts = to_experts
-                            optimal_min_loss_expert_map = min_loss_expert * reroute_mask
-                            optimal_reroute_mask = reroute_mask
-                    # construct optimal_selected_expert
-                    value_tensor = torch.tensor([-1] + optimal_to_experts, dtype=torch.long, device=hidden_states.device)
-                    map_shape = optimal_min_loss_expert_map.shape
-                    optimal_selected_expert = torch.index_select(value_tensor, 0, optimal_min_loss_expert_map.view(-1)).view(map_shape)
-                    optimal_selected_expert = optimal_selected_expert * optimal_reroute_mask + selected_experts * ~optimal_reroute_mask
+                # then on rank 7, we calculate losses
+                if self.tp_rank == self.tp_size - 1:
+                    # then we calculate the optimal expert selection
+                    # for each layer, we select k expert to reroute
+                    results = []
+                    if REROUTE_GRANULARITY == "Token":
+                        min_loss_achieved = 1e20
+                        # optimal_from_experts = None
+                        optimal_to_experts = None
+                        optimal_from_experts_tensor = None
+                        optimal_min_loss_expert_map = None
+                        optimal_reroute_mask = None
+                        # first get the ground truth output for all tokens
+                        ground_truth_output = torch.zeros((hidden_states.shape[0], selected_experts.shape[1], hidden_states.shape[1]), dtype=hidden_states.dtype, device=hidden_states.device)
+                        for expert_id in range(8):
+                            expert_mask = (selected_experts == expert_id)
+                            expert_weight = (routing_weights * expert_mask)
+                            ground_truth_output += final_hidden_states_per_expert[expert_id].unsqueeze(1).expand(-1, selected_experts.shape[1], -1) * expert_weight.unsqueeze(-1)
+                        # we enumerate over all possible dropped experts
+                        for from_experts in itertools.combinations(range(self.num_total_experts), REROUTE_OPTIMAL_K):
+                            from_expert_tensor = torch.tensor(from_experts, dtype=torch.long, device=hidden_states.device)
+                            to_experts = sorted(list(set(range(self.num_total_experts)) - set(from_experts)))
+                            reroute_mask = (routing_weights[:, 0] < REROUTE_THRESHOLD).unsqueeze(-1).expand_as(selected_experts) & (torch.isin(selected_experts, from_expert_tensor))
+                            # calculate loss: each token matching the reroute mask
+                            # has min loss across all to_experts
+                            to_experts_losses_per_token = []
+                            # first assume it is routed to nothing, i.e. zeros
+                            route_to_zero_loss = torch.linalg.norm((ground_truth_output * reroute_mask.unsqueeze(-1)), dim=-1)
+                            to_experts_losses_per_token.append(route_to_zero_loss)
+                            for to_expert in to_experts:
+                                output = final_hidden_states_per_expert[to_expert].unsqueeze(1).expand(-1, selected_experts.shape[1], -1) * routing_weights.unsqueeze(-1)
+                                to_expert_loss = torch.linalg.norm((ground_truth_output - output) * reroute_mask.unsqueeze(-1), dim=-1)
+                                to_experts_losses_per_token.append(to_expert_loss)
+                            to_experts_losses_per_token = torch.stack(to_experts_losses_per_token, dim=0) # [to_expert, batch, 2]
+                            # find argmin in to_experts dimension
+                            min_loss_expert = torch.argmin(to_experts_losses_per_token, dim=0) # [batch, 2]
+                            min_loss = torch.min(to_experts_losses_per_token, dim=0)[0].sum().item()
+                            if min_loss < min_loss_achieved:
+                                min_loss_achieved = min_loss
+                                # optimal_from_experts = from_experts
+                                optimal_from_experts_tensor = from_expert_tensor
+                                optimal_to_experts = to_experts
+                                optimal_min_loss_expert_map = min_loss_expert * reroute_mask
+                                optimal_reroute_mask = reroute_mask
+                        # log some statistics
+                        matching_tokens = torch.isin(selected_experts, optimal_from_experts_tensor)
+                        total_matching_token_count = matching_tokens.sum().item()
+                        ignored_token = matching_tokens.sum().item() - (optimal_reroute_mask & matching_tokens).sum().item()
+                        print("In Layer {}, ignored {}/{} (bs: {}) tokens due to exceeding threshold".format(self.layer_idx, ignored_token, total_matching_token_count, hidden_states.shape[0]), flush=True)
+                        print(f"Optimal expert selection for layer {self.layer_idx} is {optimal_to_experts}", flush=True)
+                        # construct optimal_selected_expert
+                        value_tensor = torch.tensor([-1] + optimal_to_experts, dtype=torch.long, device=hidden_states.device)
+                        map_shape = optimal_min_loss_expert_map.shape
+                        optimal_selected_expert = torch.index_select(value_tensor, 0, optimal_min_loss_expert_map.view(-1)).view(map_shape)
+                        optimal_selected_expert = optimal_selected_expert * optimal_reroute_mask + selected_experts * ~optimal_reroute_mask
+                    else:
+                        loss_dict = {}
+                        for expert_1 in range(self.num_total_experts):
+                            for expert_2 in range(self.num_total_experts):
+                                if expert_1 == expert_2:
+                                    continue
+                                loss = torch.linalg.norm(final_hidden_states_per_expert[expert_1] - final_hidden_states_per_expert[expert_2], dim=1)
+                                loss_dict[(expert_1, expert_2)] = loss
+                        for from_expert in range(self.num_total_experts):
+                            for to_expert in range(self.num_total_experts):
+                                if from_expert == to_expert:
+                                    continue
+                                # loss if we reroute from_expert to to_expert
+                                loss = loss_dict[(from_expert, to_expert)]
+                                reroute_mask = (routing_weights[:, 0] < REROUTE_THRESHOLD).unsqueeze(-1).expand_as(selected_experts) & (selected_experts == from_expert)
+                                reroute_mask_float = reroute_mask.float().sum(dim=-1, keepdim=True)
+                                reroute_loss = (loss * reroute_mask_float).sum()
+                                results.append((reroute_loss, (from_expert, to_expert)))
+                        # sort the results and select top k
+                        results = sorted(results, key=lambda x: x[0])
+                        top_k_results = []
+                        experts_to_remove = set()
+                        experts_to_retain = set()
+                        for _ in range(REROUTE_OPTIMAL_K):
+                            for r in results:
+                                if r[1][0] not in experts_to_remove and r[1][0] not in experts_to_retain and r[1][1] not in experts_to_remove:
+                                    top_k_results.append(r)
+                                    experts_to_remove.add(r[1][0])
+                                    experts_to_retain.add(r[1][1])
+                                    break
+                        # print(f"Optimal expert selection for layer {self.layer_idx} is {[x[1] for x in top_k_results]}", flush=True)
+                        optimal_selected_expert = selected_experts.clone()
+                        for _, (from_expert, to_expert) in top_k_results:
+                            optimal_selected_expert[optimal_selected_expert == from_expert] = to_expert
+                    reroute_mask = (routing_weights[:, 0] < REROUTE_THRESHOLD).unsqueeze(-1).expand_as(selected_experts)
+                    selected_experts = optimal_selected_expert * reroute_mask + selected_experts * ~reroute_mask
+                    # log total activated experts
+                    unique_experts = torch.unique(optimal_selected_expert).tolist()
+                    expert_count = len([x for x in unique_experts if 0 <= x < 8])
+                    print(f"Layer {self.layer_idx} has {expert_count} experts activated ({unique_experts})", flush=True)
+                    # broadcast the selected experts
+                    selected_experts = tensor_model_parallel_all_reduce(selected_experts)
                 else:
-                    loss_dict = {}
-                    for expert_1 in range(self.num_total_experts):
-                        for expert_2 in range(self.num_total_experts):
-                            if expert_1 == expert_2:
-                                continue
-                            loss = torch.linalg.norm(final_hidden_states_per_expert[expert_1] - final_hidden_states_per_expert[expert_2], dim=1)
-                            loss_dict[(expert_1, expert_2)] = loss
-                    for from_expert in range(self.num_total_experts):
-                        for to_expert in range(self.num_total_experts):
-                            if from_expert == to_expert:
-                                continue
-                            # loss if we reroute from_expert to to_expert
-                            loss = loss_dict[(from_expert, to_expert)]
-                            reroute_mask = (routing_weights[:, 0] < REROUTE_THRESHOLD).unsqueeze(-1).expand_as(selected_experts) & (selected_experts == from_expert)
-                            reroute_mask_float = reroute_mask.float().sum(dim=-1, keepdim=True)
-                            reroute_loss = (loss * reroute_mask_float).sum()
-                            results.append((reroute_loss, (from_expert, to_expert)))
-                    # sort the results and select top k
-                    results = sorted(results, key=lambda x: x[0])
-                    top_k_results = []
-                    experts_to_remove = set()
-                    experts_to_retain = set()
-                    for _ in range(REROUTE_OPTIMAL_K):
-                        for r in results:
-                            if r[1][0] not in experts_to_remove and r[1][0] not in experts_to_retain and r[1][1] not in experts_to_remove:
-                                top_k_results.append(r)
-                                experts_to_remove.add(r[1][0])
-                                experts_to_retain.add(r[1][1])
-                                break
-                    # print(f"Optimal expert selection for layer {self.layer_idx} is {[x[1] for x in top_k_results]}", flush=True)
-                    optimal_selected_expert = selected_experts.clone()
-                    for _, (from_expert, to_expert) in top_k_results:
-                        optimal_selected_expert[optimal_selected_expert == from_expert] = to_expert
-                reroute_mask = (routing_weights[:, 0] < REROUTE_THRESHOLD).unsqueeze(-1).expand_as(selected_experts)
-                selected_experts = optimal_selected_expert * reroute_mask + selected_experts * ~reroute_mask
-                # broadcast the selected experts
-                selected_experts = tensor_model_parallel_all_reduce(selected_experts)
-            else:
-                selected_experts = torch.zeros_like(selected_experts)
-                selected_experts = tensor_model_parallel_all_reduce(selected_experts)
-
+                    selected_experts = torch.zeros_like(selected_experts)
+                    selected_experts = tensor_model_parallel_all_reduce(selected_experts)
+            except Exception as e:
+                print("Error in MixtralMoE calculating optimal routing", e, flush=True)
+                raise e
 
         if self.parallel_method == MixtralParallelism.TENSOR_EXPERT_PARALLEL:
             if not is_decode or self.layer_idx >= MERGED_MAX_LAYERS or not MERGED_DIR:

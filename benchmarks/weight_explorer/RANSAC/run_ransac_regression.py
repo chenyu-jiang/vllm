@@ -7,6 +7,7 @@ import torch
 
 from vllm.model_executor.weight_utils import hf_model_weights_iterator
 
+from tqdm import tqdm
 
 def _to_torch_dtype(dtype):
     if not isinstance(dtype, torch.dtype):
@@ -33,7 +34,7 @@ def evaluate(
     per_expert_inliners = []
     for x, w in zip(xs, weights):
         diff_mat = x @ (merged_weight - w.t())
-        n_inliners = torch.sum(torch.abs(diff_mat) < threshold).item()
+        n_inliners = torch.sum(torch.mean(torch.abs(diff_mat), dim=-1) < threshold)
         diff_norm = torch.norm(diff_mat, dim=1)
         element_wise_diff = torch.mean(torch.abs(diff_mat))
         per_expert_diff_norm_mean.append(torch.mean(diff_norm).item())
@@ -84,33 +85,43 @@ def ransac(
 
     best_inliners = 0
     best_weight = None
-    for _ in range(max_iterations):
-        # random sample
-        sample_indices = sorted(
-            np.random.choice(total_samples, n_samples, replace=False).tolist()
-        )
-        # construct sampled xs
-        sampled_xs = []
-        per_expert_indices = [[] for _ in range(len(xs))]
-        for index in sample_indices:
-            expert_id = np.argmax(cumsum_samples > index)
-            per_expert_indices[expert_id].append(
-                index - cumsum_samples[expert_id - 1]
-                if expert_id > 0
-                else index
+    with tqdm(total=max_iterations) as pbar:
+        for _ in range(max_iterations):
+            # random sample
+            sample_indices = sorted(
+                np.random.choice(total_samples, n_samples, replace=False).tolist()
             )
-        for expert_id, indices in enumerate(per_expert_indices):
-            sampled_xs.append(xs[expert_id][indices])
-        # fit
-        merged_weight = fit_once(weights, sampled_xs, alpha=alpha)
-        # evaluate
-        _, _, per_expert_inliners = evaluate(
-            merged_weight, weights, xs, threshold=inliner_threshold
-        )
-        total_inliners = sum(per_expert_inliners)
-        if total_inliners > best_inliners:
-            best_inliners = total_inliners
-            best_weight = merged_weight
+            # construct sampled xs
+            sampled_xs = []
+            per_expert_indices = [[] for _ in range(len(xs))]
+            for index in sample_indices:
+                expert_id = np.argmax(cumsum_samples > index)
+                per_expert_indices[expert_id].append(
+                    index - cumsum_samples[expert_id - 1]
+                    if expert_id > 0
+                    else index
+                )
+            for expert_id, indices in enumerate(per_expert_indices):
+                sampled_xs.append(xs[expert_id][indices])
+                pbar.write(f"Expert {expert_id} - {len(indices)} samples")
+            # fit
+            merged_weight = fit_once(weights, sampled_xs, alpha=alpha)
+            # evaluate
+            mean_norm, mean_diff, per_expert_inliners = evaluate(
+                merged_weight, weights, xs, threshold=inliner_threshold
+            )
+            mean_norm = sum(mean_norm) / len(mean_norm)
+            mean_diff = sum(mean_diff) / len(mean_diff)
+            total_inliners = sum(per_expert_inliners)
+            pbar.set_postfix(
+                mean_norm=mean_norm,
+                mean_diff=mean_diff,
+                best_inliner_ratio= best_inliners / total_samples,
+            )
+            if total_inliners > best_inliners:
+                best_inliners = total_inliners
+                best_weight = merged_weight
+            pbar.update(1)
     return best_weight
 
 
@@ -197,10 +208,11 @@ def main():
     parser.add_argument(
         "--experts_to_merge", type=str, default="0,1,2,3,4,5,6,7"
     )
+    parser.add_argument("--max_iterations", type=int, default=1000)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--layer_id", type=int, default=0)
-    parser.add_argument("--sample_ratio", type=float, default=0.125)
-    parser.add_argument("--inliner_threshold", type=float, default=1e-4)
+    parser.add_argument("--sample_ratio", type=float, default=0.05)
+    parser.add_argument("--inliner_threshold", type=float, default=1e-3)
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     args = parser.parse_args()

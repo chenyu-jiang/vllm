@@ -106,6 +106,15 @@ if REROUTE_OPTIMAL_K is not None:
 REROUTE_GRANULARITY = os.environ.get("MIXTRAL_REROUTE_GRANULARITY", "Expert")
 if REROUTE_GRANULARITY not in ["Expert", "Token"]:
     raise ValueError(f"Invalid reroute granularity {REROUTE_GRANULARITY}")
+LOG_REROUTE_COUNTS = os.environ.get("MIXTRAL_LOG_REROUTE_COUNTS", False)
+if LOG_REROUTE_COUNTS is not None:
+    LOG_REROUTE_COUNTS = bool(LOG_REROUTE_COUNTS)
+PENALIZE_REROUTE_NEW_TOKENS = os.environ.get("MIXTRAL_PENALIZE_REROUTE_NEW_TOKENS", False)
+if PENALIZE_REROUTE_NEW_TOKENS is not None:
+    PENALIZE_REROUTE_NEW_TOKENS = bool(PENALIZE_REROUTE_NEW_TOKENS)
+PENALIZE_REROUTE_ALPHA = os.environ.get("MIXTRAL_PENALIZE_REROUTE_ALPHA", 1.0)
+if PENALIZE_REROUTE_ALPHA is not None:
+    PENALIZE_REROUTE_ALPHA = float(PENALIZE_REROUTE_ALPHA)
 
 INJECT_NOISE_STD = os.environ.get("MIXTRAL_INJECT_NOISE_STD", None)
 if INJECT_NOISE_STD is not None:
@@ -397,7 +406,7 @@ class MixtralMoE(nn.Module):
             self.predictors.append(predictor)
         print(f"Loaded predictors for layer {self.layer_idx}", flush=True)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, rerouted_tokens_mask: torch.Tensor) -> torch.Tensor:
         is_decode = hidden_states.shape[0] == 1
         # print(f"MixtralMoE forward for layer {self.layer_idx}, shape {hidden_states.shape} on rank {self.tp_rank}", flush=True)
         try:
@@ -416,6 +425,8 @@ class MixtralMoE(nn.Module):
             print("Error in MixtralMoE forward", e, flush=True)
             raise e
 
+        reroute_count = None
+        new_rerouted_tokens_mask = None
         if REROUTE_MAP_DICT and is_decode:
             src_expert_id, dst_expert_id = list(REROUTE_MAP_DICT[self.layer_idx].items())[0]
             reroute_mask = routing_weights[:, 0] < REROUTE_THRESHOLD
@@ -466,6 +477,7 @@ class MixtralMoE(nn.Module):
                             from_expert_tensor = torch.tensor(from_experts, dtype=torch.long, device=hidden_states.device)
                             to_experts = sorted(list(set(range(self.num_total_experts)) - set(from_experts)))
                             reroute_mask = (routing_weights[:, 0] < REROUTE_THRESHOLD).unsqueeze(-1).expand_as(selected_experts) & (torch.isin(selected_experts, from_expert_tensor))
+                            new_tokens_rerouted = ((reroute_mask.sum(dim=-1) > 0) & (~rerouted_tokens_mask)).sum()
                             # calculate loss: each token matching the reroute mask
                             # has min loss across all to_experts
                             to_experts_losses_per_token = []
@@ -479,7 +491,7 @@ class MixtralMoE(nn.Module):
                             to_experts_losses_per_token = torch.stack(to_experts_losses_per_token, dim=0) # [to_expert, batch, 2]
                             # find argmin in to_experts dimension
                             min_loss_expert = torch.argmin(to_experts_losses_per_token, dim=0) # [batch, 2]
-                            min_loss = torch.min(to_experts_losses_per_token, dim=0)[0].sum().item()
+                            min_loss = (torch.min(to_experts_losses_per_token, dim=0)[0].sum() * (1 + PENALIZE_REROUTE_ALPHA * new_tokens_rerouted / reroute_mask.sum())).item()
                             if min_loss < min_loss_achieved:
                                 min_loss_achieved = min_loss
                                 # optimal_from_experts = from_experts
@@ -491,8 +503,12 @@ class MixtralMoE(nn.Module):
                         matching_tokens = torch.isin(selected_experts, optimal_from_experts_tensor)
                         total_matching_token_count = matching_tokens.sum().item()
                         ignored_token = matching_tokens.sum().item() - (optimal_reroute_mask & matching_tokens).sum().item()
+                        if (optimal_reroute_mask & matching_tokens).sum().item() == 0:
+                            mean_loss_per_token = None
+                        else:
+                            mean_loss_per_token = float(min_loss_achieved) / ((optimal_reroute_mask & matching_tokens).sum().item())
                         print("In Layer {}, ignored {}/{} (bs: {}) tokens due to exceeding threshold".format(self.layer_idx, ignored_token, total_matching_token_count, hidden_states.shape[0]), flush=True)
-                        print(f"Optimal expert selection for layer {self.layer_idx} is {optimal_to_experts}", flush=True)
+                        print(f"Optimal expert selection for layer {self.layer_idx} is {optimal_to_experts}, mean loss per token: {mean_loss_per_token}", flush=True)
                         # construct optimal_selected_expert
                         value_tensor = torch.tensor([-1] + optimal_to_experts, dtype=torch.long, device=hidden_states.device)
                         map_shape = optimal_min_loss_expert_map.shape
@@ -533,7 +549,10 @@ class MixtralMoE(nn.Module):
                         for _, (from_expert, to_expert) in top_k_results:
                             optimal_selected_expert[optimal_selected_expert == from_expert] = to_expert
                     reroute_mask = (routing_weights[:, 0] < REROUTE_THRESHOLD).unsqueeze(-1).expand_as(selected_experts)
+                    orig_selected_experts = selected_experts.clone()
                     selected_experts = optimal_selected_expert * reroute_mask + selected_experts * ~reroute_mask
+                    reroute_count = (orig_selected_experts != selected_experts).sum(dim=-1)
+                    new_rerouted_tokens_mask = rerouted_tokens_mask | (reroute_count > 0)
                     # log total activated experts
                     unique_experts = torch.unique(optimal_selected_expert).tolist()
                     expert_count = len([x for x in unique_experts if 0 <= x < 8])
@@ -564,7 +583,7 @@ class MixtralMoE(nn.Module):
                     else:
                         final_hidden_states.add_(current_hidden_states)
                 return tensor_model_parallel_all_reduce(final_hidden_states).view(
-                    batch_size, sequence_length, hidden_dim)
+                    batch_size, sequence_length, hidden_dim), reroute_count, new_rerouted_tokens_mask
             try:
                 # first we calculate the actual hidden states per expert
                 final_hidden_states_per_expert = []
@@ -629,11 +648,11 @@ class MixtralMoE(nn.Module):
                         expert_weight = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
                         final_hidden_states.add_(final_hidden_states_per_expert[expert_id] * expert_weight)
                     return tensor_model_parallel_all_reduce(final_hidden_states).view(
-                        batch_size, sequence_length, hidden_dim)
+                        batch_size, sequence_length, hidden_dim), reroute_count, new_rerouted_tokens_mask
                 else:
                     final_hidden_states = torch.zeros_like(hidden_states)
                     return tensor_model_parallel_all_reduce(final_hidden_states).view(
-                        batch_size, sequence_length, hidden_dim)
+                        batch_size, sequence_length, hidden_dim), reroute_count, new_rerouted_tokens_mask
 
             except Exception as e:
                 print("Error in MixtralMoE forward", e, flush=True)
@@ -724,7 +743,7 @@ class MixtralMoE(nn.Module):
                                 self.top_k,
                                 n_tokens,
                                 hidden_dim)
-            return gathered_hidden_states.view(batch_size, sequence_length, hidden_dim)
+            return gathered_hidden_states.view(batch_size, sequence_length, hidden_dim), reroute_count, new_rerouted_tokens_mask
 
 
 class MixtralAttention(nn.Module):
@@ -839,6 +858,7 @@ class MixtralDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rerouted_tokens_mask: Optional[torch.Tensor],
         kv_cache: KVCache,
         input_metadata: InputMetadata,
         residual: Optional[torch.Tensor],
@@ -860,8 +880,8 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states)
-        return hidden_states, residual
+        hidden_states, reroute_count, new_rerouted_tokens_mask = self.block_sparse_moe(hidden_states, rerouted_tokens_mask)
+        return hidden_states, residual, reroute_count, new_rerouted_tokens_mask
 
 
 class MixtralModel(nn.Module):
@@ -897,12 +917,24 @@ class MixtralModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
+        if get_tensor_model_parallel_rank() == get_tensor_model_parallel_world_size() - 1:
+            rerouted_tokens_mask = torch.zeros((hidden_states.shape[0] * hidden_states.shape[1]), dtype=torch.bool, device=hidden_states.device)
+        else:
+            rerouted_tokens_mask = None
+        per_layer_reroute_counts = []
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(positions, hidden_states,
+            hidden_states, residual, reroute_count, rerouted_tokens_mask = layer(positions, hidden_states, rerouted_tokens_mask,
                                             kv_caches[i], input_metadata,
                                             residual)
+            if reroute_count is not None:
+                per_layer_reroute_counts.append(reroute_count)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if len(per_layer_reroute_counts) > 0 and LOG_REROUTE_COUNTS:
+            # sum up reroute counts
+            reroute_counts = torch.stack(per_layer_reroute_counts, dim=1).sum(dim=1)
+            print(f"Total rerouted tokens: {reroute_counts.tolist()}", flush=True)
+
         return hidden_states
 
     def load_merged_weight(self):

@@ -186,6 +186,7 @@ _build/
 benchmarks/mixtral_*
 benchmarks/plot_*
 benchmarks/**/*.pdf
+benchmarks/**/*.png
 benchmarks/**/*_dataset/*
 benchmarks/**/*.txt
 benchmarks/**/*.sh

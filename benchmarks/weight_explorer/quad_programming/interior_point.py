@@ -3,6 +3,7 @@ from torchmin import minimize as torch_minimize
 
 import numpy as np
 from scipy.optimize import NonlinearConstraint, minimize
+import gurobipy as gp
 
 from typing import Callable
 
@@ -26,7 +27,8 @@ def interior_point(
     x0: torch.Tensor,
     t_init: float = 1,
     mu: float = 0.5,
-    tol: float = 1e-8,
+    tol: float = 1e-5,
+    ttol: float = 1e-5,
     method: str = "l-bfgs",
 ):
     # implement interior point method
@@ -40,24 +42,23 @@ def interior_point(
     def barrier(x, t):
         return -t * SafeLog.apply(-inequality_constraint(x))
 
-    # t_current = t_init
-    t_current = 0
+    t_current = t_init
     x_opt = x0
     iteration_count = 0
     while True:
         def augmented_objective(x):
-            return torch.sum(objective(x)) # + barrier(x, t_current))
+            return torch.sum(objective(x) + barrier(x, t_current))
 
         # solve the unconstrained problem
         opt_result = torch_minimize(
-            augmented_objective, x_opt, method=method, tol=tol
+            augmented_objective, x_opt, method=method, tol=tol, disp=0
         )
         if not opt_result.success:
             raise RuntimeError("Optimization failed: " + opt_result.message)
         x_opt = opt_result.x
 
         # check stopping criterion
-        if t_current < tol:
+        if t_current < ttol:
             break
         # update t
         t_current *= mu
@@ -89,6 +90,16 @@ def ref_scipy(
 
     return x_opt
 
+def ref_gurobi(x0: torch.Tensor):
+    model = gp.Model("qp")
+    x = model.addMVar(shape=tuple(x0.shape), name="x", lb=-gp.GRB.INFINITY, ub=gp.GRB.INFINITY)
+    model.setObjective((x ** 2).sum(), gp.GRB.MINIMIZE)
+    model.addConstr(x.sum(axis=-1) >= 2)
+    model.setParam("OutputFlag", 0)
+    model.optimize()
+    x_opt = x.X
+    return x_opt
+
 
 def test_interior_point(dtype=torch.float, batched=False):
     # test the interior point method
@@ -113,13 +124,17 @@ def test_interior_point(dtype=torch.float, batched=False):
 
     x0_np = x0_torch.cpu().numpy()
     if not batched:
-        x_opt_np = ref_scipy(objective_np, inequality_constraint_np, x0_np)
+        # x_opt_np = ref_scipy(objective_np, inequality_constraint_np, x0_np)
+        x_opt_np = ref_gurobi(x0_torch)
     else:
         x_opt_np = []
         for i in range(n_dim[0]):
-            x_opt_np_i = ref_scipy(objective_np, inequality_constraint_np, x0_np[i])
+            # x_opt_np_i = ref_scipy(objective_np, inequality_constraint_np, x0_np[i])
+            x_opt_np_i = ref_gurobi(x0_torch[i])
             x_opt_np.append(x_opt_np_i)
         x_opt_np = np.stack(x_opt_np)
+    import code
+    code.interact(local=locals())
     assert np.allclose(x_opt_torch.cpu().numpy(), x_opt_np, atol=1e-4)
 
 if __name__ == "__main__":

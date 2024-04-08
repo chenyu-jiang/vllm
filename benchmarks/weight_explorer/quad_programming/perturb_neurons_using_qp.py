@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from vllm.model_executor.weight_utils import hf_model_weights_iterator
 
+import gurobipy as gp
 from interior_point import interior_point
 
 from tqdm import tqdm, trange
@@ -25,6 +26,46 @@ def get_output_subdir(args, override_weight_id=None):
     return f"w{args.weight_id}_l{args.layer_id}_e{args.expert_id}"
 
 
+def solve_qp_gurobi(
+    neurons_to_replace: np.ndarray,  # shape (1, d) or (b, d)
+    neurons_to_perturb: np.ndarray,  # shape (b, d)
+    x0: np.ndarray,  # shape (d, n)
+    xi: np.ndarray,  # shape (d, n)
+    norm_limit: float,
+):
+    if len(neurons_to_perturb.shape) == 1:
+        neurons_to_replace = neurons_to_replace.unsqueeze(0)
+
+    assert neurons_to_perturb.shape[1] == neurons_to_replace.shape[1]
+    assert neurons_to_perturb.shape[0] == neurons_to_replace.shape[0] or neurons_to_replace.shape[0] == 1
+
+    model = gp.Model("qp")
+    result_neurons = model.addMVar(shape=tuple(neurons_to_perturb.shape), name="x", lb=-gp.GRB.INFINITY, ub=gp.GRB.INFINITY)
+    # aux variable z_obj for each row of norm((neurons_to_replace - result_neuron) @ x0, dim=-1)
+    z_obj = model.addMVar(shape=(neurons_to_perturb.shape[0],), name="z_obj", lb=0, ub=gp.GRB.INFINITY)
+    # constraint for z_obj
+    for i in range(neurons_to_perturb.shape[0]):
+        t = model.addMVar(shape=(x0.shape[1]), lb=-gp.GRB.INFINITY, ub=gp.GRB.INFINITY)
+        model.addConstr(t == result_neurons[i] @ x0 - neurons_to_replace[i] @ x0)
+        model.addGenConstrNorm(z_obj[i], t, 2)
+    # objective
+    model.setObjective(z_obj.sum(), gp.GRB.MINIMIZE)
+    # aux variable z_con for each row of norm((result_neuron - neurons_to_perturb) @ xi, dim=-1)
+    z_con = model.addMVar(shape=(neurons_to_perturb.shape[0],), name="z_con", lb=0, ub=gp.GRB.INFINITY)
+    # constraint for z_con
+    for i in range(neurons_to_perturb.shape[0]):
+        t = model.addMVar(shape=(xi.shape[1]), lb=-gp.GRB.INFINITY, ub=gp.GRB.INFINITY)
+        model.addConstr(t == result_neurons[i] @ xi - neurons_to_perturb[i] @ xi)
+        model.addGenConstrNorm(z_con[i], t, 2)
+    # constraint
+    model.addConstr(z_con.sum() / xi.shape[1] <= norm_limit)
+
+    model.optimize()
+    if model.status != gp.GRB.OPTIMAL:
+        raise RuntimeError("Optimization failed: " + model.status)
+    result_neuron = result_neurons.X
+    optimal_objective = model.ObjVal
+    return result_neuron, optimal_objective
 
 def solve_qp(
     neurons_to_replace: torch.Tensor,  # shape (1, d) or (b, d)
@@ -42,15 +83,13 @@ def solve_qp(
     def objective(result_neuron):
         # (neuron_to_replace - result_neuron) @ x0 shape: (b, n)
         return (
-            torch.norm((neurons_to_replace - result_neuron) @ x0, dim=-1) ** 2
+            torch.norm((neurons_to_replace - result_neuron) @ x0, dim=-1)
         )
-
-    print("Norm limit: ", norm_limit)
 
     def constraint(result_neuron):
         # (result_neuron - neurons_to_perturb) @ xi shape: (b, n)
         return (
-            (torch.norm((result_neuron - neurons_to_perturb) @ xi, dim=-1) ** 2) / xi.shape[1]
+            (torch.norm((result_neuron - neurons_to_perturb) @ xi, dim=-1)) / xi.shape[1]
             - norm_limit
         )
 
@@ -58,8 +97,6 @@ def solve_qp(
     result_neuron = neurons_to_perturb.clone()
     # solve using interior point method
     result_neuron = interior_point(objective, constraint, result_neuron)
-    import code
-    code.interact(local=locals())
     final_objective = objective(result_neuron)
     final_constraint = constraint(result_neuron)
     return result_neuron, final_objective, final_constraint
@@ -107,7 +144,7 @@ def train(
                 this_batch_neurons,
                 current_expert_x,
                 this_expert_xs,
-                (norm_limit * norm_limit) * this_expert_xs.shape[1],
+                norm_limit * this_expert_xs.shape[1],
             )
             # calculate error
             reconstruct_error = (
@@ -179,7 +216,7 @@ def train_with_most_similar_hueristic(
         ) // batch_size
         batch_outs = []
         batch_objectives = []
-        batch_constraints = []
+        # batch_constraints = []
         for i in trange(n_batches, desc="Neuron Batch", leave=False):
             this_batch_neurons_to_perturb = this_expert_neurons_to_perturb[
                 i * batch_size : (i + 1) * batch_size
@@ -187,19 +224,23 @@ def train_with_most_similar_hueristic(
             this_batch_neurons_to_remove = this_expert_neurons_to_remove[
                 i * batch_size : (i + 1) * batch_size
             ]
-            perturbed_neuron, final_objective, final_constraint = solve_qp(
-                this_batch_neurons_to_remove,
-                this_batch_neurons_to_perturb,
-                current_expert_x,
-                this_expert_xs,
+            # perturbed_neuron, final_objective, final_constraint = solve_qp(
+            perturbed_neuron, final_objective = solve_qp_gurobi(
+                this_batch_neurons_to_remove.cpu().numpy(),
+                this_batch_neurons_to_perturb.cpu().numpy(),
+                current_expert_x.cpu().numpy(),
+                this_expert_xs.float().cpu().numpy(),
                 (norm_limit * norm_limit)
             )
+            import code
+            code.interact(local=locals())
             batch_outs.append(perturbed_neuron)
             batch_objectives.append(final_objective)
-            batch_constraints.append(final_constraint)
+            # batch_constraints.append(final_constraint)
         mean_objective = torch.concat(batch_objectives).mean().item()
-        max_constraint = torch.concat(batch_constraints).max().item()
-        print(f"Expert {expert_id}: Mean Objective: {mean_objective}, Max Constraint: {max_constraint}")
+        # max_constraint = torch.concat(batch_constraints).max().item()
+        # print(f"Expert {expert_id}: Mean Objective: {mean_objective}, Max Constraint: {max_constraint}")
+        print(f"Expert {expert_id}: Mean Objective: {mean_objective}")
         perturbed_neuron_per_expert[expert_id] = torch.cat(batch_outs, dim=0)
     # reorder
     result = []
@@ -218,7 +259,7 @@ def create_dataloaders(args):
             )
         )["arr_0"]
         data = data.reshape(-1, 4096)
-        data = torch.tensor(data, dtype=torch.bfloat16, device=args.device)
+        data = torch.tensor(data, dtype=torch.float, device=args.device)
         data_per_expert.append(data)
     return data_per_expert
 
@@ -241,6 +282,7 @@ def main_func(args, save=True):
         weights.append(
             exper_id_to_params[expert_id][f"w{args.weight_id}"]
             .to(args.device)
+            .float()
         )
     if args.weight_id == 2:
         w1_weights = []
@@ -248,11 +290,11 @@ def main_func(args, save=True):
         for expert_id in range(8):
             w1_weights.append(
                 exper_id_to_params[expert_id][f"w1"]
-                .to(args.device)
+                .float()
             )
             w3_weights.append(
                 exper_id_to_params[expert_id][f"w3"]
-                .to(args.device)
+                .float()
             )
     # load data
     data = create_dataloaders(args)
@@ -274,8 +316,8 @@ def main_func(args, save=True):
                 "results.pt",
             )
         )
-        perturbed_w1 = perturbed_w1.to(device=args.device).bfloat16()
-        perturbed_w3 = perturbed_w3.to(device=args.device).bfloat16()
+        perturbed_w1 = perturbed_w1.to(device=args.device).float()
+        perturbed_w3 = perturbed_w3.to(device=args.device).float()
         # obtain w2 input
         current_expert_x = F.silu(data[args.expert_id] @ perturbed_w1.t()) * (data[args.expert_id] @ perturbed_w3.t())
         current_expert_x = current_expert_x.t()
@@ -285,14 +327,21 @@ def main_func(args, save=True):
     other_expert_neurons = [weights[x] for x in other_expert_ids]
     if args.weight_id == 2:
         # obtain w2 input
-        other_expert_xs = [
-            (F.silu(data[x] @ w1_weights[x].t()) * (data[x] @ w3_weights[x].t())).t()
-            for x in other_expert_ids
-        ]
+        other_expert_xs = []
+        for x in other_expert_ids:
+            w1_weight = w1_weights[x].to(args.device).bfloat16()
+            w3_weight = w3_weights[x].to(args.device).bfloat16()
+            w1_out = data[x].bfloat16() @ w1_weight.t()
+            del w1_weight
+            w1_out = F.silu(w1_out, inplace=True)
+            w3_out = data[x].bfloat16() @ w3_weight.t()
+            del w3_weight
+            other_expert_xs.append((w1_out * w3_out).t())
         del w1_weights
         del w3_weights
     else:
         other_expert_xs = [data[x].t() for x in other_expert_ids]
+    del data
     perturbed_neurons = train_with_most_similar_hueristic(
         current_neurons,
         current_expert_x,
@@ -317,7 +366,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--weight_id", type=int, default=1)
     parser.add_argument("--expert_id", type=int, default=0)
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--norm_limit", type=float, default=1e-4)
     parser.add_argument("--euc_dist_quantile_filter", type=float, default=0.05)
     parser.add_argument("--layer_id", type=int, default=0)

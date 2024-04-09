@@ -5,8 +5,6 @@ from typing import List
 import numpy as np
 import torch
 
-from lapsolver import solve_dense
-
 from vllm.model_executor.weight_utils import hf_model_weights_iterator
 
 def _to_torch_dtype(dtype):
@@ -33,11 +31,8 @@ def evaluate(merged_weight: torch.Tensor, weights: List[torch.Tensor], xs: List[
 
 def get_output_subdir(args, override_weight_id=None):
     if override_weight_id is not None:
-        return f"w{override_weight_id}_l{args.layer_id}_esrc{args.expert_to_adapt}_edst{args.expert_to_match}_lambda{args.lamb}" + "_permute" if args.permute else ""
-    return f"w{args.weight_id}_l{args.layer_id}_esrc{args.expert_to_adapt}_edst{args.expert_to_match}_lambda{args.lamb}" + "_permute" if args.permute else ""
-
-def get_permutation_output_subdir(args):
-    return f"permute_l{args.layer_id}_esrc{args.expert_to_adapt}_edst{args.expert_to_match}"
+        return f"w{override_weight_id}_l{args.layer_id}_esrc{args.expert_to_adapt}_edst{args.expert_to_match}_lambda{args.lamb}"
+    return f"w{args.weight_id}_l{args.layer_id}_esrc{args.expert_to_adapt}_edst{args.expert_to_match}_lambda{args.lamb}"
 
 def train(w_match: torch.Tensor, w_adapt: torch.Tensor, x_match: torch.Tensor, x_adapt: torch.Tensor, lamb=0.5):
     # lambda = 1 -> only match, lambda = 0 -> only adapt
@@ -59,49 +54,6 @@ def train(w_match: torch.Tensor, w_adapt: torch.Tensor, x_match: torch.Tensor, x
     optimal_weight = inv_sum_inner_products @ weighted_sum_xT_x_w
     return optimal_weight
 
-def solve_permutation_lap(
-    w1_match: torch.Tensor,
-    w1_permute: torch.Tensor,
-    w3_match: torch.Tensor,
-    w3_permute: torch.Tensor,
-    w2_match: torch.Tensor,
-    w2_permute: torch.Tensor,):
-    # calculate pairwise cosine similarity
-    w1_match_normed = w1_match / torch.norm(w1_match, dim=1, keepdim=True)
-    w1_permute_normed = w1_permute / torch.norm(w1_permute, dim=1, keepdim=True)
-    w3_match_normed = w3_match / torch.norm(w3_match, dim=1, keepdim=True)
-    w3_permute_normed = w3_permute / torch.norm(w3_permute, dim=1, keepdim=True)
-    w2_match_normed = w2_match / torch.norm(w2_match, dim=1, keepdim=True)
-    w2_permute_normed = w2_permute / torch.norm(w2_permute, dim=1, keepdim=True)
-
-    cost_matrix = w1_permute_normed @ w1_match_normed.t() + w3_permute_normed @ w3_match_normed.t() + w2_permute_normed.t() @ w2_match_normed
-    # solve the linear assignment problem
-    row_ind, col_ind = solve_dense(cost_matrix.float().cpu().numpy())
-    return row_ind, col_ind
-
-
-def solve_permutation(args, exper_id_to_params: dict):
-    # solve permutation first
-    w1_match = exper_id_to_params[args.expert_to_match]["w1"].to(device=args.device, dtype=_to_torch_dtype(args.dtype))
-    w1_adapt = exper_id_to_params[args.expert_to_adapt]["w1"].to(device=args.device, dtype=_to_torch_dtype(args.dtype))
-    w3_match = exper_id_to_params[args.expert_to_match]["w3"].to(device=args.device, dtype=_to_torch_dtype(args.dtype))
-    w3_adapt = exper_id_to_params[args.expert_to_adapt]["w3"].to(device=args.device, dtype=_to_torch_dtype(args.dtype))
-    w2_match = exper_id_to_params[args.expert_to_match]["w2"].to(device=args.device, dtype=_to_torch_dtype(args.dtype))
-    w2_adapt = exper_id_to_params[args.expert_to_adapt]["w2"].to(device=args.device, dtype=_to_torch_dtype(args.dtype))
-    row_ind, col_ind = solve_permutation_lap(w1_match, w1_adapt, w3_match, w3_adapt, w2_match, w2_adapt)
-    if not os.path.exists(os.path.join(args.output_dir, get_permutation_output_subdir(args))):
-        os.makedirs(os.path.join(args.output_dir, get_permutation_output_subdir(args)), exist_ok=True)
-    torch.save((row_ind, col_ind), os.path.join(args.output_dir, get_permutation_output_subdir(args), "permutation_indices.pt"))
-
-def permute_weights(args, w_adapt):
-    row_ind, col_ind = torch.load(os.path.join(args.output_dir, get_permutation_output_subdir(args), "permutation_indices.pt"))
-    permutation_matrix = torch.zeros((row_ind.shape[0], row_ind.shape[0]), device=args.device, dtype=_to_torch_dtype(args.dtype))
-    permutation_matrix[row_ind, col_ind] = 1
-    if args.weight_id == 1 or args.weight_id == 3:
-        w_adapt = permutation_matrix @ w_adapt
-    else:
-        w_adapt = w_adapt @ permutation_matrix.t()
-    return w_adapt
 
 def create_dataloaders(args):
     data_per_expert = []
@@ -112,7 +64,6 @@ def create_dataloaders(args):
         data_per_expert.append(data)
     x_match, x_adapt = data_per_expert
     return x_match, x_adapt
-
 
 def main_func(args, save=True):
     # load weights
@@ -128,12 +79,8 @@ def main_func(args, save=True):
             for w_name in ["w1", "w2", "w3"]:
                 if w_name in name:
                     exper_id_to_params[expert_id][w_name] = param
-    if args.permute and not os.path.exists(os.path.join(args.output_dir, get_permutation_output_subdir(args), "permutation_indices.pt")):
-        solve_permutation(args, exper_id_to_params)
     w_match = exper_id_to_params[args.expert_to_match][f"w{args.weight_id}"].to(device=args.device, dtype=_to_torch_dtype(args.dtype))
     w_adapt = exper_id_to_params[args.expert_to_adapt][f"w{args.weight_id}"].to(device=args.device, dtype=_to_torch_dtype(args.dtype))
-    if args.permute:
-        w_adapt = permute_weights(args, w_adapt)
     # load data
     x_match, x_adapt = create_dataloaders(args)
     if args.weight_id == 2:
@@ -168,13 +115,11 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dtype", type=str, default="float")
     parser.add_argument("--weight_id", type=int, default=1)
-    parser.add_argument("--expert_to_match", type=int, default=0)
-    parser.add_argument("--expert_to_adapt", type=int, default=1)
-    parser.add_argument("--lamb", type=float, default=0.5)
+    parser.add_argument("--expert_id", type=int, default=0)
+    parser.add_argument("--k", type=int, default=16)
     parser.add_argument("--layer_id", type=int, default=0)
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--permute", action="store_true")
     args = parser.parse_args()
 
     assert args.weight_id in [1,2,3], "Weight ID must be in {1, 2, 3}"

@@ -3,7 +3,7 @@ import copy
 import os
 import pickle
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Optional
 
 from vllm.config import (CacheConfig, DeviceConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, SpeculativeConfig,
@@ -197,7 +197,7 @@ class RayGPUExecutor(ExecutorBase):
             max_parallel_loading_workers,
         )
 
-    def determine_num_available_blocks(self) -> tuple[int, int]:
+    def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available KV blocks.
 
         This invokes `determine_num_available_blocks` on each worker and takes

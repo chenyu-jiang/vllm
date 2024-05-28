@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import argparse
 
 import torch
 import torch.nn.functional as F
@@ -9,23 +10,38 @@ import triton
 from vllm.model_executor.layers.fused_moe import (fused_moe,
                                                   get_config_file_name)
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+from tqdm import tqdm
+
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--num_experts", type=int, default=8)
+    parser.add_argument("--tp_size", type=int, default=2)
+    args = parser.parse_args()
+
     method = fused_moe
-    for bs in [
-            1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536,
-            2048, 3072, 4096
-    ]:
-        run_grid(bs, method=method)
+    if not args.profile:
+        for bs in tqdm([
+                1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536,
+                2048, 3072, 4096
+        ]):
+            run_grid(bs, args.num_experts, args.tp_size, method=method)
+    else:
+        for bs in tqdm([
+                1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536,
+                2048, 3072, 4096
+        ]):
+            for tp_size in [1, 2, 4, 8]:
+                for num_experts in [1, 2, 4, 6, 8]:
+                    run_grid(bs, num_experts, tp_size, method=method, profile=True)
 
 
-def run_grid(bs, method):
+def run_grid(bs: int, num_total_experts: int, tp_size: int, method, profile=False):
     d_model = 4096
-    num_total_experts = 8
     top_k = 2
-    tp_size = 2
     model_intermediate_size = 14336
     num_layers = 32
     num_calls = 100
@@ -33,40 +49,43 @@ def run_grid(bs, method):
     num_warmup_trials = 1
     num_trials = 1
 
-    configs = []
-    if bs <= 16:
-        BLOCK_SIZES_M = [16]
-    elif bs <= 32:
-        BLOCK_SIZES_M = [16, 32]
-    elif bs <= 64:
-        BLOCK_SIZES_M = [16, 32, 64]
-    elif bs <= 128:
-        BLOCK_SIZES_M = [16, 32, 64, 128]
+    if profile:
+        configs = [None]
     else:
-        BLOCK_SIZES_M = [16, 32, 64, 128, 256]
+        configs = []
+        if bs <= 16:
+            BLOCK_SIZES_M = [16]
+        elif bs <= 32:
+            BLOCK_SIZES_M = [16, 32]
+        elif bs <= 64:
+            BLOCK_SIZES_M = [16, 32, 64]
+        elif bs <= 128:
+            BLOCK_SIZES_M = [16, 32, 64, 128]
+        else:
+            BLOCK_SIZES_M = [16, 32, 64, 128, 256]
 
-    for block_size_n in [32, 64, 128, 256]:
-        for block_size_m in BLOCK_SIZES_M:
-            for block_size_k in [64, 128, 256]:
-                for group_size_m in [1, 16, 32, 64]:
-                    for num_warps in [4, 8]:
-                        configs.append({
-                            "BLOCK_SIZE_M": block_size_m,
-                            "BLOCK_SIZE_N": block_size_n,
-                            "BLOCK_SIZE_K": block_size_k,
-                            "GROUP_SIZE_M": group_size_m,
-                            "num_warps": num_warps,
-                            "num_stages": 4,
-                        })
+        for block_size_n in [32, 64, 128, 256]:
+            for block_size_m in BLOCK_SIZES_M:
+                for block_size_k in [64, 128, 256]:
+                    for group_size_m in [1, 16, 32, 64]:
+                        for num_warps in [4, 8]:
+                            configs.append({
+                                "BLOCK_SIZE_M": block_size_m,
+                                "BLOCK_SIZE_N": block_size_n,
+                                "BLOCK_SIZE_K": block_size_k,
+                                "GROUP_SIZE_M": group_size_m,
+                                "num_warps": num_warps,
+                                "num_stages": 4,
+                            })
 
     best_config = None
     best_time_us = 1e20
 
     for config in configs:
-        print(f'{tp_size=} {bs=}')
-        print(f'{config}')
+        # print(f'{tp_size=} {bs=}')
+        # print(f'{config}')
         # warmup
-        print('warming up')
+        # print('warming up')
         try:
             for _ in range(num_warmup_trials):
                 run_timing(
@@ -84,7 +103,7 @@ def run_grid(bs, method):
             continue
 
         # trial
-        print('benchmarking')
+        # print('benchmarking')
         for _ in range(num_trials):
             kernel_dur_ms = run_timing(
                 num_calls=num_calls,
@@ -109,21 +128,54 @@ def run_grid(bs, method):
                   f' {bs=} {tp_size=} {top_k=} {num_total_experts=} '
                   f'{d_model=} {model_intermediate_size=} {num_layers=}')
 
-    print("best_time_us", best_time_us)
-    print("best_config", best_config)
+    # print("best_time_us", best_time_us)
+    # print("best_config", best_config)
 
-    # holds Dict[str, Dict[str, int]]
-    filename = get_config_file_name(num_total_experts,
-                                    model_intermediate_size // tp_size)
-    print(f"writing config to file {filename}")
-    existing_content = {}
-    if os.path.exists(filename):
-        with open(filename, "r") as f:
-            existing_content = json.load(f)
-    existing_content[str(bs)] = best_config
-    with open(filename, "w") as f:
-        json.dump(existing_content, f, indent=4)
-        f.write("\n")
+    if profile:
+        filename = get_config_file_name(num_total_experts,
+                                        model_intermediate_size // tp_size)
+        filename = filename.replace(".json", "_profile.json")
+        # print(f"writing profile to file {filename}")
+        bs_profiled = []
+        n_experts_profiled = []
+        tp_size_profiled = []
+        kernel_dur_ms_profiled = []
+        model_dur_ms_profiled = []
+        if os.path.exists(filename):
+            with open(filename, "r") as f:
+                existing_content = json.load(f)
+                bs_profiled = existing_content.get("bs", [])
+                n_experts_profiled = existing_content.get("n_experts", [])
+                tp_size_profiled = existing_content.get("tp_size", [])
+                kernel_dur_ms_profiled = existing_content.get("kernel_dur_ms", [])
+                model_dur_ms_profiled = existing_content.get("model_dur_ms", [])
+        bs_profiled.append(bs)
+        n_experts_profiled.append(num_total_experts)
+        tp_size_profiled.append(tp_size)
+        kernel_dur_ms_profiled.append(best_time_us / 1000.0)
+        model_dur_ms_profiled.append(best_time_us / 1000.0 * num_layers)
+        with open(filename, "w") as f:
+            json.dump({
+                "bs": bs_profiled,
+                "n_experts": n_experts_profiled,
+                "tp_size": tp_size_profiled,
+                "kernel_dur_ms": kernel_dur_ms_profiled,
+                "model_dur_ms": model_dur_ms_profiled,
+            }, f, indent=4)
+            f.write("\n")
+    else:
+        # holds Dict[str, Dict[str, int]]
+        filename = get_config_file_name(num_total_experts,
+                                        model_intermediate_size // tp_size)
+        # print(f"writing config to file {filename}")
+        existing_content = {}
+        if os.path.exists(filename):
+            with open(filename, "r") as f:
+                existing_content = json.load(f)
+        existing_content[str(bs)] = best_config
+        with open(filename, "w") as f:
+            json.dump(existing_content, f, indent=4)
+            f.write("\n")
 
 
 def run_timing(num_calls: int, bs: int, d_model: int, num_total_experts: int,

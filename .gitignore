@@ -185,3 +185,5 @@ hip_compat.h
 
 # Benchmark dataset
 *.json
+benchmarks/**/*.pdf
+benchmarks/**/*.png

@@ -10,7 +10,7 @@ from ray.experimental.tqdm_ray import tqdm
 from transformers import AutoConfig
 
 from vllm.model_executor.layers.fused_moe.fused_moe import *
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
 
 def get_config_file_extended_name(E: int, N: int, dtype: Optional[str], num_shared_experts: int = 0) -> str:
     device_name = torch.cuda.get_device_name().replace(" ", "_")
@@ -19,35 +19,6 @@ def get_config_file_extended_name(E: int, N: int, dtype: Optional[str], num_shar
         return f"E={E},N={N},device_name={device_name}{dtype_selector}.json"
     else:
         return f"E={E},N={N},ExpShared={num_shared_experts},device_name={device_name}{dtype_selector}.json"
-
-@functools.lru_cache
-def get_moe_configs_extended(E: int, N: int,
-                    dtype: Optional[str], num_shared_experts: int = 0) -> Optional[Dict[int, Any]]:
-    """
-    Return optimized configurations for the fused MoE kernel.
-
-    The return value will be a dictionary that maps an irregular grid of
-    batch sizes to configurations of the fused_moe kernel. To evaluate the
-    kernel on a given batch size bs, the closest batch size in the grid should
-    be picked and the associated configuration chosen to invoke the kernel.
-    """
-
-    # First look up if an optimized configuration is available in the configs
-    # directory
-    json_file_name = get_config_file_extended_name(E, N, dtype, num_shared_experts)
-
-    config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name)
-    if os.path.exists(config_file_path):
-        with open(config_file_path) as f:
-            logger.info("Using configuration from %s for MoE layer.",
-                        config_file_path)
-            # If a configuration has been found, return it
-            return {int(key): val for key, val in json.load(f).items()}
-
-    # If no optimized configuration is available, we will use the default
-    # configuration
-    return None
 
 class BenchmarkConfig(TypedDict):
     BLOCK_SIZE_M: int
@@ -72,11 +43,11 @@ def benchmark_config(
 ) -> float:
     init_dtype = torch.float16 if use_fp8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-    w1 = torch.randn(num_experts,
+    w1 = torch.randn(num_experts + num_shared_experts,
                      shard_intermediate_size,
                      hidden_size,
                      dtype=init_dtype)
-    w2 = torch.randn(num_experts,
+    w2 = torch.randn(num_experts + num_shared_experts,
                      hidden_size,
                      shard_intermediate_size // 2,
                      dtype=init_dtype)
@@ -85,35 +56,30 @@ def benchmark_config(
                                 num_experts,
                                 dtype=torch.float32)
 
-    topk_weights, topk_ids = fused_topk(x, gating_output.reshape(-1, num_experts), topk, True)
-    topk_weights = topk_weights.reshape(num_iters, num_tokens, topk)
-    topk_ids = topk_ids.reshape(num_iters, num_tokens, topk)
-    if num_shared_experts:
-        topk_weights = torch.cat([topk_weights, torch.ones(num_shared_experts, dtype=dtype).expand(num_iters, num_tokens, -1)], dim=-1)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_ids = torch.cat([topk_ids + num_shared_experts, torch.arange(0, num_shared_experts, 1).expand(num_iters, num_tokens, -1)], dim=-1)
-
     w1_scale = None
     w2_scale = None
     a1_scale = None
     a2_scale = None
     if use_fp8:
-        w1_scale = torch.randn(num_experts, dtype=torch.float32)
-        w2_scale = torch.randn(num_experts, dtype=torch.float32)
+        w1_scale = torch.randn(num_experts + num_shared_experts, dtype=torch.float32)
+        w2_scale = torch.randn(num_experts + num_shared_experts, dtype=torch.float32)
         a1_scale = torch.randn(1, dtype=torch.float32)
         a2_scale = torch.randn(1, dtype=torch.float32)
 
         w1 = w1.to(torch.float8_e4m3fn)
         w2 = w2.to(torch.float8_e4m3fn)
 
-    # input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
-
     topk_weights_buffer = torch.empty(num_tokens, topk + num_shared_experts, dtype=dtype)
     topk_indices_buffer = torch.empty(num_tokens, topk + num_shared_experts, dtype=torch.int32)
 
     def prepare(i: int):
-        topk_weights_buffer.copy_(topk_weights[i])
-        topk_indices_buffer.copy_(topk_ids[i])
+        topk_weights, topk_ids = fused_topk(x, gating_output[i], topk, True)
+        if num_shared_experts:
+            topk_weights = torch.cat([topk_weights, torch.ones(num_shared_experts, dtype=dtype).expand(num_tokens, -1)], dim=-1)
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_ids = torch.cat([topk_ids + num_shared_experts, torch.arange(0, num_shared_experts, 1).expand(num_tokens, -1)], dim=-1)
+        topk_weights_buffer.copy_(topk_weights)
+        topk_indices_buffer.copy_(topk_ids)
 
     def run():
         fused_experts(
@@ -195,6 +161,33 @@ class BenchmarkWorker:
         torch.cuda.manual_seed_all(seed)
         self.seed = seed
 
+    def get_moe_configs_extended(self, E: int, N: int,
+                    dtype: Optional[str], num_shared_experts: int = 0) -> Optional[Dict[int, Any]]:
+        """
+        Return optimized configurations for the fused MoE kernel.
+
+        The return value will be a dictionary that maps an irregular grid of
+        batch sizes to configurations of the fused_moe kernel. To evaluate the
+        kernel on a given batch size bs, the closest batch size in the grid should
+        be picked and the associated configuration chosen to invoke the kernel.
+        """
+
+        # First look up if an optimized configuration is available in the configs
+        # directory
+        json_file_name = get_config_file_extended_name(E, N, dtype, num_shared_experts)
+
+        config_file_path = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name)
+        if os.path.exists(config_file_path):
+            with open(config_file_path) as f:
+                print(f"Using configuration from {config_file_path} for MoE layer.")
+                # If a configuration has been found, return it
+                return {int(key): val for key, val in json.load(f).items()}
+
+        # If no optimized configuration is available, we will use the default
+        # configuration
+        return None
+
     def benchmark(
         self,
         num_tokens: int,
@@ -211,8 +204,8 @@ class BenchmarkWorker:
         dtype_str = "float8" if use_fp8 else None
         # NOTE(woosuk): The current naming convention uses w2.shape[2], which
         # is the intermediate size after silu_and_mul.
-        op_config = get_moe_configs_extended(num_experts, shard_intermediate_size // 2,
-                                    dtype_str)
+        op_config = self.get_moe_configs_extended(num_experts, shard_intermediate_size // 2,
+                                    dtype_str, num_shared_experts=num_shared_experts)
         if op_config is None:
             config = get_default_config(num_tokens, num_experts,
                                         shard_intermediate_size, hidden_size,
@@ -228,7 +221,7 @@ class BenchmarkWorker:
 
     def tune(
         self,
-        topk_selection: List[List[int]], # [num_tokens, top_k]
+        num_tokens: int,
         num_experts: int,
         shard_intermediate_size: int,
         hidden_size: int,
@@ -243,7 +236,7 @@ class BenchmarkWorker:
         for config in tqdm(search_space):
             try:
                 kernel_time = benchmark_config(config,
-                                               topk_selection,
+                                               num_tokens,
                                                num_experts,
                                                shard_intermediate_size,
                                                hidden_size,
@@ -260,7 +253,7 @@ class BenchmarkWorker:
                 best_time = kernel_time
                 best_config = config
         now = datetime.now()
-        print(f"{now.ctime()}] Completed tuning for batch_size={len(topk_selection)}")
+        print(f"[{now.ctime()}] Completed tuning for batch_size={num_tokens}")
         assert best_config is not None
         return best_config
 
@@ -304,8 +297,8 @@ def main(args: argparse.Namespace):
     topk = args.topk
     shard_intermediate_size = args.shard_intermediate_size
 
-    hidden_size = config.hidden_size
-    dtype = config.torch_dtype
+    hidden_size = args.hidden_size
+    dtype = STR_DTYPE_TO_TORCH_DTYPE[args.dtype]
     use_fp8 = args.dtype == "fp8"
     num_shared_experts = args.num_shared_experts
 
@@ -346,7 +339,7 @@ def main(args: argparse.Namespace):
             for M, config in zip(batch_sizes, configs)
         }
         save_configs(best_configs, E, shard_intermediate_size, hidden_size,
-                     topk, dtype, use_fp8)
+                     topk, dtype, use_fp8, num_shared_experts=num_shared_experts)
         end = time.time()
         print(f"Tuning took {end - start:.2f} seconds")
     else:
@@ -361,15 +354,17 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    parser = FlexibleArgumentParser()
-    parser.add_argument("--num-experts", "-e", type=int, default=160)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-size", "-b", type=int, default=None)
+    parser.add_argument("--hidden-size", type=int, default=5120)
+    parser.add_argument("--num-experts", "-e", type=int, default=20)
     parser.add_argument("--shard-intermediate-size", "-s", type=int, default=1536)
     parser.add_argument("--num-shared-experts", "-nse", type=int, default=2)
     parser.add_argument("--topk", "-k", type=int, default=6)
     parser.add_argument("--dtype",
                         type=str,
-                        choices=["fp16", "fp8"],
-                        default="fp16")
+                        choices=["bfloat16", "fp8"],
+                        default="bfloat16")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tune", action="store_true")
     args = parser.parse_args()
